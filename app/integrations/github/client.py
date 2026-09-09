@@ -475,6 +475,60 @@ class GitHubClient:
         )
         return all_commits
 
+    def get_pull_request_context(
+        self,
+        owner: str,
+        repo: str,
+        pull_number: int,
+        *,
+        max_pages: int = DEFAULT_MAX_PAGES,
+    ) -> dict:
+        """
+        Aggregate full PR investigation context from GitHub.
+
+        Combines PR metadata, changed files, and commits into a single
+        dictionary by delegating to the existing retrieval methods.
+
+        Args:
+            owner: Repository owner (user or organization).
+            repo: Repository name.
+            pull_number: Pull request number (positive integer).
+            max_pages: Maximum pagination pages for files and commits
+                       (defaults to DEFAULT_MAX_PAGES).
+
+        Returns:
+            Dict containing:
+            - pull_request (dict): Curated PR metadata.
+            - files (list[dict]): Changed file metadata with patches.
+            - commits (list[dict]): Curated commit metadata.
+
+        Raises:
+            ValueError: If parameters are invalid.
+            GitHubNotFoundError: If the repository or PR does not exist (HTTP 404).
+            GitHubAuthenticationError: If the access token is invalid or expired (HTTP 401).
+            GitHubPermissionError: If access is forbidden or rate-limited (HTTP 403).
+            GitHubAPIError: For other GitHub API HTTP errors.
+            GitHubNetworkError: For network timeouts or connection failures.
+        """
+        pr = self.get_pull_request(owner, repo, pull_number)
+        files = self.get_pull_request_files(owner, repo, pull_number, max_pages=max_pages)
+        commits = self.get_pull_request_commits(owner, repo, pull_number, max_pages=max_pages)
+
+        logger.info(
+            "Aggregated PR context for %s/%s PR #%d: %d files, %d commits",
+            owner.strip(),
+            repo.strip(),
+            pull_number,
+            len(files),
+            len(commits),
+        )
+
+        return {
+            "pull_request": pr,
+            "files": files,
+            "commits": commits,
+        }
+
     def _handle_error_response(
         self,
         response: requests.Response,
