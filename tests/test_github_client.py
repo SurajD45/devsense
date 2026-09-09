@@ -1213,5 +1213,203 @@ class TestGitHubClientGetPullRequestCommits(unittest.TestCase):
         self.assertNotIn(self.access_token, serialized)
 
 
+class TestGitHubClientGetPullRequestContext(unittest.TestCase):
+    """Test suite for get_pull_request_context aggregator method."""
+
+    def setUp(self) -> None:
+        self.access_token = "ghs_mockInstallationToken1234567890"
+        self.client = GitHubClient(self.access_token)
+        self.owner = "SurajD45"
+        self.repo = "ai-pr-investigator-demo"
+        self.pull_number = 1
+
+        self.mock_pr = {
+            "number": 1,
+            "title": "Add initial PR investigation framework",
+            "body": "Core trace verification evidence.",
+            "state": "open",
+            "author": "octocat",
+            "html_url": "https://github.com/SurajD45/ai-pr-investigator-demo/pull/1",
+            "base_branch": "main",
+            "head_branch": "feature-trace",
+            "created_at": "2026-09-01T10:00:00Z",
+            "updated_at": "2026-09-01T11:00:00Z",
+        }
+
+        self.mock_files = [
+            {
+                "filename": "app/main.py",
+                "status": "modified",
+                "additions": 15,
+                "deletions": 5,
+                "changes": 20,
+                "patch": "@@ -1,5 +1,15 @@\n+new line",
+            },
+        ]
+
+        self.mock_commits = [
+            {
+                "sha": "6dcb09b5b57875f334f61aebed695e2e4193db5e",
+                "message": "Add initial PR investigation framework",
+                "author": "Suraj Doifode",
+                "author_email": "suraj@devsense.io",
+                "committer": "GitHub",
+                "committer_email": "noreply@github.com",
+                "timestamp": "2026-09-01T10:00:00Z",
+            },
+        ]
+
+    # 1. Successful aggregation
+    @patch.object(GitHubClient, "get_pull_request_commits")
+    @patch.object(GitHubClient, "get_pull_request_files")
+    @patch.object(GitHubClient, "get_pull_request")
+    def test_successful_aggregation(self, mock_pr, mock_files, mock_commits) -> None:
+        mock_pr.return_value = self.mock_pr
+        mock_files.return_value = self.mock_files
+        mock_commits.return_value = self.mock_commits
+
+        result = self.client.get_pull_request_context(self.owner, self.repo, self.pull_number)
+
+        self.assertEqual(result["pull_request"], self.mock_pr)
+        self.assertEqual(result["files"], self.mock_files)
+        self.assertEqual(result["commits"], self.mock_commits)
+
+    # 2. get_pull_request() is called exactly once
+    @patch.object(GitHubClient, "get_pull_request_commits", return_value=[])
+    @patch.object(GitHubClient, "get_pull_request_files", return_value=[])
+    @patch.object(GitHubClient, "get_pull_request")
+    def test_get_pull_request_called_once(self, mock_pr, mock_files, mock_commits) -> None:
+        mock_pr.return_value = self.mock_pr
+
+        self.client.get_pull_request_context(self.owner, self.repo, self.pull_number)
+
+        mock_pr.assert_called_once()
+
+    # 3. get_pull_request_files() is called exactly once
+    @patch.object(GitHubClient, "get_pull_request_commits", return_value=[])
+    @patch.object(GitHubClient, "get_pull_request_files")
+    @patch.object(GitHubClient, "get_pull_request", return_value={})
+    def test_get_pull_request_files_called_once(self, mock_pr, mock_files, mock_commits) -> None:
+        mock_files.return_value = self.mock_files
+
+        self.client.get_pull_request_context(self.owner, self.repo, self.pull_number)
+
+        mock_files.assert_called_once()
+
+    # 4. get_pull_request_commits() is called exactly once
+    @patch.object(GitHubClient, "get_pull_request_commits")
+    @patch.object(GitHubClient, "get_pull_request_files", return_value=[])
+    @patch.object(GitHubClient, "get_pull_request", return_value={})
+    def test_get_pull_request_commits_called_once(self, mock_pr, mock_files, mock_commits) -> None:
+        mock_commits.return_value = self.mock_commits
+
+        self.client.get_pull_request_context(self.owner, self.repo, self.pull_number)
+
+        mock_commits.assert_called_once()
+
+    # 5. Correct owner/repo/pull_number are passed
+    @patch.object(GitHubClient, "get_pull_request_commits", return_value=[])
+    @patch.object(GitHubClient, "get_pull_request_files", return_value=[])
+    @patch.object(GitHubClient, "get_pull_request", return_value={})
+    def test_correct_arguments_passed(self, mock_pr, mock_files, mock_commits) -> None:
+        self.client.get_pull_request_context("MyOrg", "my-repo", 42)
+
+        mock_pr.assert_called_once_with("MyOrg", "my-repo", 42)
+        mock_files.assert_called_once_with("MyOrg", "my-repo", 42, max_pages=100)
+        mock_commits.assert_called_once_with("MyOrg", "my-repo", 42, max_pages=100)
+
+    # 6. max_pages is passed to both files and commits methods
+    @patch.object(GitHubClient, "get_pull_request_commits", return_value=[])
+    @patch.object(GitHubClient, "get_pull_request_files", return_value=[])
+    @patch.object(GitHubClient, "get_pull_request", return_value={})
+    def test_max_pages_passed_to_paginated_methods(self, mock_pr, mock_files, mock_commits) -> None:
+        self.client.get_pull_request_context(self.owner, self.repo, self.pull_number, max_pages=5)
+
+        mock_files.assert_called_once_with(self.owner, self.repo, self.pull_number, max_pages=5)
+        mock_commits.assert_called_once_with(self.owner, self.repo, self.pull_number, max_pages=5)
+
+    # 7. Returned dictionary contains exactly pull_request, files, commits
+    @patch.object(GitHubClient, "get_pull_request_commits", return_value=[])
+    @patch.object(GitHubClient, "get_pull_request_files", return_value=[])
+    @patch.object(GitHubClient, "get_pull_request", return_value={})
+    def test_returned_dict_has_exactly_three_keys(self, mock_pr, mock_files, mock_commits) -> None:
+        result = self.client.get_pull_request_context(self.owner, self.repo, self.pull_number)
+
+        self.assertEqual(set(result.keys()), {"pull_request", "files", "commits"})
+        self.assertEqual(len(result), 3)
+
+    # 8. Existing returned objects are preserved (identity check)
+    @patch.object(GitHubClient, "get_pull_request_commits")
+    @patch.object(GitHubClient, "get_pull_request_files")
+    @patch.object(GitHubClient, "get_pull_request")
+    def test_returned_objects_are_preserved(self, mock_pr, mock_files, mock_commits) -> None:
+        mock_pr.return_value = self.mock_pr
+        mock_files.return_value = self.mock_files
+        mock_commits.return_value = self.mock_commits
+
+        result = self.client.get_pull_request_context(self.owner, self.repo, self.pull_number)
+
+        self.assertIs(result["pull_request"], self.mock_pr)
+        self.assertIs(result["files"], self.mock_files)
+        self.assertIs(result["commits"], self.mock_commits)
+
+    # 9. Empty files list is preserved
+    @patch.object(GitHubClient, "get_pull_request_commits", return_value=[])
+    @patch.object(GitHubClient, "get_pull_request_files", return_value=[])
+    @patch.object(GitHubClient, "get_pull_request", return_value={})
+    def test_empty_files_list_preserved(self, mock_pr, mock_files, mock_commits) -> None:
+        result = self.client.get_pull_request_context(self.owner, self.repo, self.pull_number)
+
+        self.assertEqual(result["files"], [])
+        self.assertIsInstance(result["files"], list)
+
+    # 10. Empty commits list is preserved
+    @patch.object(GitHubClient, "get_pull_request_commits", return_value=[])
+    @patch.object(GitHubClient, "get_pull_request_files", return_value=[])
+    @patch.object(GitHubClient, "get_pull_request", return_value={})
+    def test_empty_commits_list_preserved(self, mock_pr, mock_files, mock_commits) -> None:
+        result = self.client.get_pull_request_context(self.owner, self.repo, self.pull_number)
+
+        self.assertEqual(result["commits"], [])
+        self.assertIsInstance(result["commits"], list)
+
+    # 11. Errors from get_pull_request() propagate
+    @patch.object(GitHubClient, "get_pull_request")
+    def test_error_from_get_pull_request_propagates(self, mock_pr) -> None:
+        mock_pr.side_effect = GitHubNotFoundError("PR not found")
+
+        with self.assertRaises(GitHubNotFoundError):
+            self.client.get_pull_request_context(self.owner, self.repo, self.pull_number)
+
+    # 12. Errors from get_pull_request_files() propagate
+    @patch.object(GitHubClient, "get_pull_request_files")
+    @patch.object(GitHubClient, "get_pull_request", return_value={})
+    def test_error_from_get_pull_request_files_propagates(self, mock_pr, mock_files) -> None:
+        mock_files.side_effect = GitHubNetworkError("timeout")
+
+        with self.assertRaises(GitHubNetworkError):
+            self.client.get_pull_request_context(self.owner, self.repo, self.pull_number)
+
+    # 13. Errors from get_pull_request_commits() propagate
+    @patch.object(GitHubClient, "get_pull_request_commits")
+    @patch.object(GitHubClient, "get_pull_request_files", return_value=[])
+    @patch.object(GitHubClient, "get_pull_request", return_value={})
+    def test_error_from_get_pull_request_commits_propagates(self, mock_pr, mock_files, mock_commits) -> None:
+        mock_commits.side_effect = GitHubAPIError("pagination limit exceeded")
+
+        with self.assertRaises(GitHubAPIError):
+            self.client.get_pull_request_context(self.owner, self.repo, self.pull_number)
+
+    # 14. No HTTP request is made directly by the aggregator
+    @patch("app.integrations.github.client.requests.get")
+    @patch.object(GitHubClient, "get_pull_request_commits", return_value=[])
+    @patch.object(GitHubClient, "get_pull_request_files", return_value=[])
+    @patch.object(GitHubClient, "get_pull_request", return_value={})
+    def test_no_direct_http_request(self, mock_pr, mock_files, mock_commits, mock_requests_get) -> None:
+        self.client.get_pull_request_context(self.owner, self.repo, self.pull_number)
+
+        mock_requests_get.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()
