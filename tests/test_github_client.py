@@ -668,5 +668,550 @@ class TestGitHubClientGetPullRequestFiles(unittest.TestCase):
         self.assertEqual(mock_get.call_count, 3)
 
 
+class TestGitHubClientGetPullRequestCommits(unittest.TestCase):
+    """Test suite for get_pull_request_commits method."""
+
+    def setUp(self) -> None:
+        self.access_token = "ghs_mockInstallationToken1234567890"
+        self.client = GitHubClient(self.access_token)
+        self.owner = "SurajD45"
+        self.repo = "ai-pr-investigator-demo"
+        self.pull_number = 1
+
+        self.mock_commit_1 = {
+            "sha": "6dcb09b5b57875f334f61aebed695e2e4193db5e",
+            "node_id": "MDY6Q29tbWl0Nmt",
+            "html_url": "https://github.com/SurajD45/ai-pr-investigator-demo/commit/6dcb09b5",
+            "comments_url": "https://api.github.com/repos/SurajD45/ai-pr-investigator-demo/commits/6dcb09b5/comments",
+            "commit": {
+                "message": "Add initial PR investigation framework",
+                "author": {
+                    "name": "Suraj Doifode",
+                    "email": "suraj@devsense.io",
+                    "date": "2026-09-01T10:00:00Z",
+                },
+                "committer": {
+                    "name": "GitHub",
+                    "email": "noreply@github.com",
+                    "date": "2026-09-01T10:05:00Z",
+                },
+                "tree": {
+                    "sha": "tree-sha-1",
+                    "url": "https://api.github.com/repos/SurajD45/ai-pr-investigator-demo/git/trees/tree-sha-1",
+                },
+            },
+            "author": {
+                "login": "SurajD45",
+                "id": 12345,
+                "type": "User",
+            },
+            "committer": {
+                "login": "web-flow",
+                "id": 19864447,
+                "type": "Bot",
+            },
+            "parents": [
+                {"sha": "parent-sha-1", "url": "https://api.github.com/repos/SurajD45/ai-pr-investigator-demo/commits/parent-sha-1"},
+            ],
+            "files": [
+                {"filename": "app/main.py", "status": "modified"},
+            ],
+        }
+
+        self.mock_commit_2 = {
+            "sha": "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0",
+            "node_id": "MDY6Q29tbWl0Nml",
+            "html_url": "https://github.com/SurajD45/ai-pr-investigator-demo/commit/a1b2c3d4",
+            "commit": {
+                "message": "Fix linting errors in webhook handler",
+                "author": {
+                    "name": "Contributor Two",
+                    "email": "contributor@example.com",
+                    "date": "2026-09-02T14:30:00Z",
+                },
+                "committer": {
+                    "name": "Contributor Two",
+                    "email": "contributor@example.com",
+                    "date": "2026-09-02T14:30:00Z",
+                },
+            },
+            "author": {
+                "login": "contributor2",
+                "id": 67890,
+                "type": "User",
+            },
+            "committer": {
+                "login": "contributor2",
+                "id": 67890,
+                "type": "User",
+            },
+            "parents": [],
+        }
+
+    # 1. Single-page successful response
+    @patch("app.integrations.github.client.requests.get")
+    def test_single_page_successful_response(self, mock_get: MagicMock) -> None:
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = [self.mock_commit_1]
+        mock_get.return_value = mock_resp
+
+        commits = self.client.get_pull_request_commits(self.owner, self.repo, self.pull_number)
+
+        self.assertEqual(len(commits), 1)
+        self.assertEqual(commits[0]["sha"], "6dcb09b5b57875f334f61aebed695e2e4193db5e")
+        self.assertEqual(commits[0]["message"], "Add initial PR investigation framework")
+        self.assertEqual(commits[0]["author"], "Suraj Doifode")
+        self.assertEqual(commits[0]["author_email"], "suraj@devsense.io")
+        self.assertEqual(commits[0]["committer"], "GitHub")
+        self.assertEqual(commits[0]["committer_email"], "noreply@github.com")
+        self.assertEqual(commits[0]["timestamp"], "2026-09-01T10:00:00Z")
+
+    # 2. Multiple-page response
+    @patch("app.integrations.github.client.requests.get")
+    def test_multiple_page_response(self, mock_get: MagicMock) -> None:
+        # Page 1: exactly per_page (100) items → triggers next page fetch
+        page1_items = [dict(self.mock_commit_1)] * 100
+        resp_page1 = MagicMock()
+        resp_page1.status_code = 200
+        resp_page1.json.return_value = page1_items
+
+        # Page 2: fewer than per_page → terminates pagination
+        resp_page2 = MagicMock()
+        resp_page2.status_code = 200
+        resp_page2.json.return_value = [self.mock_commit_2]
+
+        mock_get.side_effect = [resp_page1, resp_page2]
+
+        commits = self.client.get_pull_request_commits(self.owner, self.repo, self.pull_number)
+
+        self.assertEqual(len(commits), 101)
+        self.assertEqual(commits[0]["sha"], "6dcb09b5b57875f334f61aebed695e2e4193db5e")
+        self.assertEqual(commits[100]["sha"], "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0")
+        self.assertEqual(mock_get.call_count, 2)
+        self.assertEqual(mock_get.call_args_list[0][1]["params"]["page"], 1)
+        self.assertEqual(mock_get.call_args_list[1][1]["params"]["page"], 2)
+
+    # 3. Correct endpoint
+    @patch("app.integrations.github.client.requests.get")
+    def test_correct_endpoint_requested(self, mock_get: MagicMock) -> None:
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = []
+        mock_get.return_value = mock_resp
+
+        self.client.get_pull_request_commits("owner-org", "test-repo", 10)
+
+        called_url = mock_get.call_args[0][0]
+        expected_url = "https://api.github.com/repos/owner-org/test-repo/pulls/10/commits"
+        self.assertEqual(called_url, expected_url)
+
+    # 4. Correct query parameters (page and per_page)
+    @patch("app.integrations.github.client.requests.get")
+    def test_correct_query_parameters(self, mock_get: MagicMock) -> None:
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = []
+        mock_get.return_value = mock_resp
+
+        self.client.get_pull_request_commits(self.owner, self.repo, self.pull_number)
+
+        params = mock_get.call_args[1]["params"]
+        self.assertEqual(params["per_page"], 100)
+        self.assertEqual(params["page"], 1)
+
+    # 5. Correct Authorization header
+    @patch("app.integrations.github.client.requests.get")
+    def test_correct_authorization_header(self, mock_get: MagicMock) -> None:
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = []
+        mock_get.return_value = mock_resp
+
+        self.client.get_pull_request_commits(self.owner, self.repo, self.pull_number)
+
+        headers = mock_get.call_args[1]["headers"]
+        self.assertIn("Authorization", headers)
+        self.assertEqual(headers["Authorization"], f"Bearer {self.access_token}")
+
+    # 6. Correct GitHub API version header
+    @patch("app.integrations.github.client.requests.get")
+    def test_correct_api_version_header(self, mock_get: MagicMock) -> None:
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = []
+        mock_get.return_value = mock_resp
+
+        self.client.get_pull_request_commits(self.owner, self.repo, self.pull_number)
+
+        headers = mock_get.call_args[1]["headers"]
+        self.assertEqual(headers.get("X-GitHub-Api-Version"), "2022-11-28")
+
+    # 7. Correct Accept header
+    @patch("app.integrations.github.client.requests.get")
+    def test_correct_accept_header(self, mock_get: MagicMock) -> None:
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = []
+        mock_get.return_value = mock_resp
+
+        self.client.get_pull_request_commits(self.owner, self.repo, self.pull_number)
+
+        headers = mock_get.call_args[1]["headers"]
+        self.assertEqual(headers.get("Accept"), "application/vnd.github+json")
+
+    # 8. Correct SHA extraction
+    @patch("app.integrations.github.client.requests.get")
+    def test_correct_sha_extraction(self, mock_get: MagicMock) -> None:
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = [self.mock_commit_1, self.mock_commit_2]
+        mock_get.return_value = mock_resp
+
+        commits = self.client.get_pull_request_commits(self.owner, self.repo, self.pull_number)
+
+        self.assertEqual(commits[0]["sha"], "6dcb09b5b57875f334f61aebed695e2e4193db5e")
+        self.assertEqual(commits[1]["sha"], "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0")
+
+    # 9. Correct commit message extraction
+    @patch("app.integrations.github.client.requests.get")
+    def test_correct_commit_message_extraction(self, mock_get: MagicMock) -> None:
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = [self.mock_commit_1]
+        mock_get.return_value = mock_resp
+
+        commits = self.client.get_pull_request_commits(self.owner, self.repo, self.pull_number)
+
+        self.assertEqual(commits[0]["message"], "Add initial PR investigation framework")
+
+    # 10. Correct author name/email extraction
+    @patch("app.integrations.github.client.requests.get")
+    def test_correct_author_name_and_email_extraction(self, mock_get: MagicMock) -> None:
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = [self.mock_commit_1]
+        mock_get.return_value = mock_resp
+
+        commits = self.client.get_pull_request_commits(self.owner, self.repo, self.pull_number)
+
+        self.assertEqual(commits[0]["author"], "Suraj Doifode")
+        self.assertEqual(commits[0]["author_email"], "suraj@devsense.io")
+
+    # 11. Correct committer name/email extraction
+    @patch("app.integrations.github.client.requests.get")
+    def test_correct_committer_name_and_email_extraction(self, mock_get: MagicMock) -> None:
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = [self.mock_commit_1]
+        mock_get.return_value = mock_resp
+
+        commits = self.client.get_pull_request_commits(self.owner, self.repo, self.pull_number)
+
+        self.assertEqual(commits[0]["committer"], "GitHub")
+        self.assertEqual(commits[0]["committer_email"], "noreply@github.com")
+
+    # 12. Correct timestamp extraction
+    @patch("app.integrations.github.client.requests.get")
+    def test_correct_timestamp_extraction(self, mock_get: MagicMock) -> None:
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = [self.mock_commit_1]
+        mock_get.return_value = mock_resp
+
+        commits = self.client.get_pull_request_commits(self.owner, self.repo, self.pull_number)
+
+        self.assertEqual(commits[0]["timestamp"], "2026-09-01T10:00:00Z")
+
+    # 13. Missing/null nested author handling
+    @patch("app.integrations.github.client.requests.get")
+    def test_missing_null_nested_author_handling(self, mock_get: MagicMock) -> None:
+        commit_null_author = {
+            "sha": "abc123",
+            "commit": {
+                "message": "automated commit",
+                "author": None,
+                "committer": {
+                    "name": "Bot",
+                    "email": "bot@example.com",
+                    "date": "2026-09-03T12:00:00Z",
+                },
+            },
+        }
+        commit_missing_author = {
+            "sha": "def456",
+            "commit": {
+                "message": "another commit",
+                "committer": {
+                    "name": "Bot",
+                    "email": "bot@example.com",
+                    "date": "2026-09-03T12:00:00Z",
+                },
+            },
+        }
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = [commit_null_author, commit_missing_author]
+        mock_get.return_value = mock_resp
+
+        commits = self.client.get_pull_request_commits(self.owner, self.repo, self.pull_number)
+
+        # Null author
+        self.assertEqual(commits[0]["author"], "")
+        self.assertEqual(commits[0]["author_email"], "")
+        self.assertEqual(commits[0]["timestamp"], "")
+
+        # Missing author key
+        self.assertEqual(commits[1]["author"], "")
+        self.assertEqual(commits[1]["author_email"], "")
+        self.assertEqual(commits[1]["timestamp"], "")
+
+    # 14. Missing/null nested committer handling
+    @patch("app.integrations.github.client.requests.get")
+    def test_missing_null_nested_committer_handling(self, mock_get: MagicMock) -> None:
+        commit_null_committer = {
+            "sha": "abc123",
+            "commit": {
+                "message": "manual commit",
+                "author": {
+                    "name": "Dev",
+                    "email": "dev@example.com",
+                    "date": "2026-09-03T12:00:00Z",
+                },
+                "committer": None,
+            },
+        }
+        commit_missing_committer = {
+            "sha": "def456",
+            "commit": {
+                "message": "another commit",
+                "author": {
+                    "name": "Dev",
+                    "email": "dev@example.com",
+                    "date": "2026-09-03T12:00:00Z",
+                },
+            },
+        }
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = [commit_null_committer, commit_missing_committer]
+        mock_get.return_value = mock_resp
+
+        commits = self.client.get_pull_request_commits(self.owner, self.repo, self.pull_number)
+
+        # Null committer
+        self.assertEqual(commits[0]["committer"], "")
+        self.assertEqual(commits[0]["committer_email"], "")
+
+        # Missing committer key
+        self.assertEqual(commits[1]["committer"], "")
+        self.assertEqual(commits[1]["committer_email"], "")
+
+    # 15. Missing/null message handling
+    @patch("app.integrations.github.client.requests.get")
+    def test_missing_null_message_handling(self, mock_get: MagicMock) -> None:
+        commit_null_message = {
+            "sha": "abc123",
+            "commit": {
+                "message": None,
+                "author": {"name": "Dev", "email": "dev@example.com", "date": "2026-09-03T12:00:00Z"},
+                "committer": {"name": "Dev", "email": "dev@example.com", "date": "2026-09-03T12:00:00Z"},
+            },
+        }
+        commit_missing_commit = {
+            "sha": "def456",
+            # Entire "commit" key missing
+        }
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = [commit_null_message, commit_missing_commit]
+        mock_get.return_value = mock_resp
+
+        commits = self.client.get_pull_request_commits(self.owner, self.repo, self.pull_number)
+
+        self.assertEqual(commits[0]["message"], "")
+        self.assertEqual(commits[1]["message"], "")
+        self.assertEqual(commits[1]["author"], "")
+        self.assertEqual(commits[1]["committer"], "")
+        self.assertEqual(commits[1]["timestamp"], "")
+
+    # 16. Only the agreed fields are returned
+    @patch("app.integrations.github.client.requests.get")
+    def test_only_agreed_fields_returned(self, mock_get: MagicMock) -> None:
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = [self.mock_commit_1]
+        mock_get.return_value = mock_resp
+
+        commits = self.client.get_pull_request_commits(self.owner, self.repo, self.pull_number)
+
+        expected_fields = {"sha", "message", "author", "author_email", "committer", "committer_email", "timestamp"}
+        self.assertEqual(set(commits[0].keys()), expected_fields)
+
+        # Verify raw/unwanted fields are NOT present
+        self.assertNotIn("node_id", commits[0])
+        self.assertNotIn("html_url", commits[0])
+        self.assertNotIn("comments_url", commits[0])
+        self.assertNotIn("parents", commits[0])
+        self.assertNotIn("files", commits[0])
+        self.assertNotIn("tree", commits[0])
+        self.assertNotIn("login", commits[0])
+        self.assertNotIn("id", commits[0])
+        self.assertNotIn("type", commits[0])
+
+    # 17. 404 handling
+    @patch("app.integrations.github.client.requests.get")
+    def test_404_not_found_response(self, mock_get: MagicMock) -> None:
+        mock_resp = MagicMock()
+        mock_resp.status_code = 404
+        mock_get.return_value = mock_resp
+
+        with self.assertRaises(GitHubNotFoundError) as ctx:
+            self.client.get_pull_request_commits(self.owner, self.repo, self.pull_number)
+
+        self.assertEqual(ctx.exception.status_code, 404)
+        self.assertIn("not found", str(ctx.exception).lower())
+
+    # 18. 401 handling
+    @patch("app.integrations.github.client.requests.get")
+    def test_401_unauthorized_response(self, mock_get: MagicMock) -> None:
+        mock_resp = MagicMock()
+        mock_resp.status_code = 401
+        mock_get.return_value = mock_resp
+
+        with self.assertRaises(GitHubAuthenticationError) as ctx:
+            self.client.get_pull_request_commits(self.owner, self.repo, self.pull_number)
+
+        self.assertEqual(ctx.exception.status_code, 401)
+        self.assertNotIn(self.access_token, str(ctx.exception))
+
+    # 19. 403 handling
+    @patch("app.integrations.github.client.requests.get")
+    def test_403_forbidden_response(self, mock_get: MagicMock) -> None:
+        mock_resp = MagicMock()
+        mock_resp.status_code = 403
+        mock_get.return_value = mock_resp
+
+        with self.assertRaises(GitHubPermissionError) as ctx:
+            self.client.get_pull_request_commits(self.owner, self.repo, self.pull_number)
+
+        self.assertEqual(ctx.exception.status_code, 403)
+        self.assertNotIn(self.access_token, str(ctx.exception))
+
+    # 20. Other HTTP error handling
+    @patch("app.integrations.github.client.requests.get")
+    def test_other_http_error_response(self, mock_get: MagicMock) -> None:
+        mock_resp = MagicMock()
+        mock_resp.status_code = 502
+        mock_get.return_value = mock_resp
+
+        with self.assertRaises(GitHubAPIError) as ctx:
+            self.client.get_pull_request_commits(self.owner, self.repo, self.pull_number)
+
+        self.assertEqual(ctx.exception.status_code, 502)
+        self.assertIn("HTTP 502", str(ctx.exception))
+        self.assertNotIn(self.access_token, str(ctx.exception))
+
+    # 21. Timeout handling
+    @patch("app.integrations.github.client.requests.get")
+    def test_timeout_failure(self, mock_get: MagicMock) -> None:
+        mock_get.side_effect = requests.exceptions.Timeout("Read timeout")
+
+        with self.assertRaises(GitHubNetworkError) as ctx:
+            self.client.get_pull_request_commits(self.owner, self.repo, self.pull_number)
+
+        self.assertIn("timed out", str(ctx.exception).lower())
+        self.assertNotIn(self.access_token, str(ctx.exception))
+
+    # 22. Network failure handling
+    @patch("app.integrations.github.client.requests.get")
+    def test_network_failure(self, mock_get: MagicMock) -> None:
+        mock_get.side_effect = requests.exceptions.ConnectionError("Network disconnected")
+
+        with self.assertRaises(GitHubNetworkError) as ctx:
+            self.client.get_pull_request_commits(self.owner, self.repo, self.pull_number)
+
+        self.assertIn("network error", str(ctx.exception).lower())
+        self.assertNotIn(self.access_token, str(ctx.exception))
+
+    # 23. Pagination terminates when len(data) < per_page
+    @patch("app.integrations.github.client.requests.get")
+    def test_pagination_terminates_on_fewer_items_than_per_page(self, mock_get: MagicMock) -> None:
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = [self.mock_commit_1]  # 1 item < 100 per_page
+        mock_get.return_value = mock_resp
+
+        commits = self.client.get_pull_request_commits(self.owner, self.repo, self.pull_number)
+
+        self.assertEqual(len(commits), 1)
+        self.assertEqual(mock_get.call_count, 1)
+
+    # 24. Pagination terminates on empty response
+    @patch("app.integrations.github.client.requests.get")
+    def test_pagination_terminates_on_empty_list(self, mock_get: MagicMock) -> None:
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = []
+        mock_get.return_value = mock_resp
+
+        commits = self.client.get_pull_request_commits(self.owner, self.repo, self.pull_number)
+
+        self.assertEqual(len(commits), 0)
+        self.assertEqual(mock_get.call_count, 1)
+
+    # 25. max_pages infinite-loop protection
+    @patch("app.integrations.github.client.requests.get")
+    def test_infinite_pagination_loop_protection(self, mock_get: MagicMock) -> None:
+        # Every page returns exactly per_page (100) items → never terminates naturally
+        infinite_resp = MagicMock()
+        infinite_resp.status_code = 200
+        infinite_resp.json.return_value = [self.mock_commit_1] * 100
+        mock_get.return_value = infinite_resp
+
+        with self.assertRaises(GitHubAPIError) as ctx:
+            self.client.get_pull_request_commits(self.owner, self.repo, self.pull_number, max_pages=3)
+
+        self.assertIn("exceeded maximum pagination limit", str(ctx.exception).lower())
+        self.assertEqual(mock_get.call_count, 3)
+
+    # 26. Input validation
+    def test_input_validation(self) -> None:
+        with self.assertRaises(ValueError):
+            self.client.get_pull_request_commits("", self.repo, self.pull_number)
+        with self.assertRaises(ValueError):
+            self.client.get_pull_request_commits("   ", self.repo, self.pull_number)
+        with self.assertRaises(ValueError):
+            self.client.get_pull_request_commits(self.owner, "", self.pull_number)
+        with self.assertRaises(ValueError):
+            self.client.get_pull_request_commits(self.owner, "   ", self.pull_number)
+        with self.assertRaises(ValueError):
+            self.client.get_pull_request_commits(self.owner, self.repo, 0)
+        with self.assertRaises(ValueError):
+            self.client.get_pull_request_commits(self.owner, self.repo, -1)
+        with self.assertRaises(ValueError):
+            self.client.get_pull_request_commits(self.owner, self.repo, 1, max_pages=0)
+        with self.assertRaises(ValueError):
+            self.client.get_pull_request_commits(self.owner, self.repo, 1, max_pages=-5)
+        with self.assertRaises(ValueError):
+            self.client.get_pull_request_commits(self.owner, self.repo, 1, max_pages="10")
+
+    # 27. Access token never leaked in returned data
+    @patch("app.integrations.github.client.requests.get")
+    def test_access_token_not_in_returned_data(self, mock_get: MagicMock) -> None:
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = [self.mock_commit_1]
+        mock_get.return_value = mock_resp
+
+        commits = self.client.get_pull_request_commits(self.owner, self.repo, self.pull_number)
+
+        serialized = str(commits)
+        self.assertNotIn(self.access_token, serialized)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -332,6 +332,149 @@ class GitHubClient:
         )
         return all_files
 
+    def get_pull_request_commits(
+        self,
+        owner: str,
+        repo: str,
+        pull_number: int,
+        *,
+        max_pages: int = DEFAULT_MAX_PAGES,
+    ) -> list[dict]:
+        """
+        Retrieve the list of commits associated with a specific Pull Request.
+
+        Handles pagination automatically to retrieve all commits across
+        pages until the last page or max_pages safety limit.
+
+        Args:
+            owner: Repository owner (user or organization).
+            repo: Repository name.
+            pull_number: Pull request number (positive integer).
+            max_pages: Maximum number of pages to fetch (safety termination limit,
+                       defaults to 100).
+
+        Returns:
+            List of dicts, each containing:
+            - sha (str)
+            - message (str)
+            - author (str)
+            - author_email (str)
+            - committer (str)
+            - committer_email (str)
+            - timestamp (str)
+
+        Raises:
+            ValueError: If parameters are invalid.
+            GitHubNotFoundError: If the repository or PR does not exist (HTTP 404).
+            GitHubAuthenticationError: If the access token is invalid or expired (HTTP 401).
+            GitHubPermissionError: If access is forbidden or rate-limited (HTTP 403).
+            GitHubAPIError: For other GitHub API HTTP errors or if max_pages limit is reached.
+            GitHubNetworkError: For network timeouts or connection failures.
+        """
+        if not owner or not isinstance(owner, str) or not owner.strip():
+            raise ValueError("owner must be a non-empty string")
+        if not repo or not isinstance(repo, str) or not repo.strip():
+            raise ValueError("repo must be a non-empty string")
+        if not isinstance(pull_number, int) or pull_number <= 0:
+            raise ValueError("pull_number must be a positive integer")
+        if isinstance(max_pages, bool) or not isinstance(max_pages, int) or max_pages <= 0:
+            raise ValueError("max_pages must be a positive integer")
+
+        owner_clean = owner.strip()
+        repo_clean = repo.strip()
+
+        url = f"{self._base_url}/repos/{owner_clean}/{repo_clean}/pulls/{pull_number}/commits"
+        headers = self._headers()
+
+        all_commits: list[dict] = []
+        page = 1
+        per_page = 100
+
+        while True:
+            if page > max_pages:
+                logger.error(
+                    "Exceeded pagination limit of %d pages for %s/%s PR #%d commits",
+                    max_pages,
+                    owner_clean,
+                    repo_clean,
+                    pull_number,
+                )
+                raise GitHubAPIError(
+                    f"Exceeded maximum pagination limit ({max_pages} pages) while fetching commits for {owner_clean}/{repo_clean} PR #{pull_number}"
+                )
+
+            params = {"per_page": per_page, "page": page}
+
+            try:
+                response = requests.get(
+                    url,
+                    headers=headers,
+                    params=params,
+                    timeout=self._timeout,
+                )
+            except requests.exceptions.Timeout as exc:
+                logger.error(
+                    "GitHub API timeout while fetching PR #%d commits for %s/%s (page %d)",
+                    pull_number,
+                    owner_clean,
+                    repo_clean,
+                    page,
+                )
+                raise GitHubNetworkError(
+                    f"Request timed out while fetching PR #{pull_number} commits for {owner_clean}/{repo_clean}"
+                ) from exc
+            except requests.exceptions.RequestException as exc:
+                logger.error(
+                    "GitHub API network failure while fetching PR #%d commits for %s/%s (page %d): %s",
+                    pull_number,
+                    owner_clean,
+                    repo_clean,
+                    page,
+                    type(exc).__name__,
+                )
+                raise GitHubNetworkError(
+                    f"Network error while communicating with GitHub API: {type(exc).__name__}"
+                ) from exc
+
+            if response.status_code != 200:
+                self._handle_error_response(response, owner_clean, repo_clean, pull_number)
+
+            data = response.json()
+            if not isinstance(data, list):
+                logger.error(
+                    "Unexpected GitHub API response format for %s/%s PR #%d commits (expected list, got %s)",
+                    owner_clean,
+                    repo_clean,
+                    pull_number,
+                    type(data).__name__,
+                )
+                raise GitHubAPIError(
+                    f"Unexpected response format from GitHub API: expected list, got {type(data).__name__}"
+                )
+
+            if not data:
+                break
+
+            for item in data:
+                all_commits.append(self._extract_commit_metadata(item))
+
+            # Deterministic page-size pagination:
+            # If fewer items than per_page were returned, this is the last page.
+            if len(data) < per_page:
+                break
+
+            page += 1
+
+        logger.info(
+            "Retrieved %d commits for %s/%s PR #%d across %d page(s)",
+            len(all_commits),
+            owner_clean,
+            repo_clean,
+            pull_number,
+            page,
+        )
+        return all_commits
+
     def _handle_error_response(
         self,
         response: requests.Response,
@@ -420,4 +563,30 @@ class GitHubClient:
             "deletions": data.get("deletions", 0),
             "changes": data.get("changes", 0),
             "patch": patch,
+        }
+
+    @staticmethod
+    def _extract_commit_metadata(data: dict) -> dict:
+        """Extract and sanitize only the required commit metadata.
+
+        Uses nested commit.author / commit.committer objects (not the
+        top-level author/committer) per the DevSense data contract.
+        Missing or null nested objects safely default to empty strings.
+        """
+        commit = data.get("commit") or {}
+
+        commit_author = commit.get("author") or {}
+        commit_committer = commit.get("committer") or {}
+
+        raw_message = commit.get("message")
+        message = "" if raw_message is None else str(raw_message)
+
+        return {
+            "sha": data.get("sha", ""),
+            "message": message,
+            "author": commit_author.get("name", ""),
+            "author_email": commit_author.get("email", ""),
+            "committer": commit_committer.get("name", ""),
+            "committer_email": commit_committer.get("email", ""),
+            "timestamp": commit_author.get("date", ""),
         }
