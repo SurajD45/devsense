@@ -64,30 +64,97 @@ HANDLED_PR_ACTIONS = {"opened", "synchronize", "reopened"}
 
 def extract_pr_info(payload: dict) -> dict | None:
     """
-    Extract safe, loggable metadata from a pull_request webhook payload.
+    Extract safe metadata and required investigation identifiers from a
+    pull_request webhook payload.
 
-    Returns None if the action is not one we handle.
+    Required fields:
+      - installation_id: positive integer
+      - owner: non-empty string
+      - repo: non-empty string
+      - pull_number: positive integer
+
+    Returns None if:
+      - The payload is not a dictionary.
+      - The action is not in HANDLED_PR_ACTIONS.
+      - Any required field is missing, null, or invalid.
 
     Args:
         payload: The parsed JSON body of the webhook request.
 
     Returns:
-        A dict with safe PR metadata, or None if the action is ignored.
+        A dict with validated PR identifiers and safe metadata, or None.
     """
-    action = payload.get("action", "")
+    if not isinstance(payload, dict):
+        return None
 
+    action = payload.get("action", "")
     if action not in HANDLED_PR_ACTIONS:
         return None
 
-    pr = payload.get("pull_request", {})
-    repo = payload.get("repository", {})
+    # Safely extract nested structures
+    pr = payload.get("pull_request")
+    if not isinstance(pr, dict):
+        return None
+
+    repo = payload.get("repository")
+    if not isinstance(repo, dict):
+        return None
+
+    installation = payload.get("installation")
+    if not isinstance(installation, dict):
+        return None
+
+    # 1. Validate installation_id
+    installation_id = installation.get("id")
+    if isinstance(installation_id, bool) or not isinstance(installation_id, int) or installation_id <= 0:
+        return None
+
+    # 2. Validate pull_number
+    pull_number = pr.get("number")
+    if isinstance(pull_number, bool) or not isinstance(pull_number, int) or pull_number <= 0:
+        return None
+
+    # 3. Validate repo name & owner
+    repo_name = repo.get("name")
+    owner_data = repo.get("owner")
+    owner_login = owner_data.get("login") if isinstance(owner_data, dict) else None
+
+    # Fallback to repo.full_name if owner or name not explicitly provided
+    if not owner_login or not repo_name:
+        full_name = repo.get("full_name")
+        if isinstance(full_name, str) and "/" in full_name:
+            parts = full_name.split("/", 1)
+            owner_login = owner_login or parts[0]
+            repo_name = repo_name or parts[1]
+
+    if not isinstance(owner_login, str) or not owner_login.strip():
+        return None
+
+    if not isinstance(repo_name, str) or not repo_name.strip():
+        return None
+
+    owner_clean = owner_login.strip()
+    repo_clean = repo_name.strip()
+    repo_full_name = repo.get("full_name") or f"{owner_clean}/{repo_clean}"
+
+    # Extract additional metadata safely
+    user = pr.get("user")
+    pr_author = user.get("login", "unknown") if isinstance(user, dict) else "unknown"
+
+    head = pr.get("head")
+    source_branch = head.get("ref", "unknown") if isinstance(head, dict) else "unknown"
+
+    base = pr.get("base")
+    target_branch = base.get("ref", "unknown") if isinstance(base, dict) else "unknown"
 
     return {
         "action": action,
-        "repo_full_name": repo.get("full_name", "unknown"),
-        "pr_number": pr.get("number"),
-        "pr_url": pr.get("html_url", ""),
-        "pr_author": pr.get("user", {}).get("login", "unknown"),
-        "source_branch": pr.get("head", {}).get("ref", "unknown"),
-        "target_branch": pr.get("base", {}).get("ref", "unknown"),
+        "installation_id": installation_id,
+        "owner": owner_clean,
+        "repo": repo_clean,
+        "pull_number": pull_number,
+        "repo_full_name": repo_full_name,
+        "pr_author": pr_author,
+        "source_branch": source_branch,
+        "target_branch": target_branch,
     }
