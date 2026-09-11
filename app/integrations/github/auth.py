@@ -57,9 +57,15 @@ def create_jwt(app_id: str, private_key_path: str) -> str:
         Encoded JWT string.
 
     Raises:
+        ValueError:        If app_id or private_key_path is invalid, or key file is empty.
         FileNotFoundError: If the private key file does not exist.
-        ValueError:        If the private key file is empty or unreadable.
     """
+    if not app_id or not isinstance(app_id, str) or not app_id.strip():
+        raise ValueError("app_id must be a non-empty string")
+
+    if not private_key_path or not isinstance(private_key_path, str) or not private_key_path.strip():
+        raise ValueError("private_key_path must be a non-empty string")
+
     # Validate the key path without revealing key contents in errors.
     if not os.path.isfile(private_key_path):
         raise FileNotFoundError(
@@ -72,7 +78,7 @@ def create_jwt(app_id: str, private_key_path: str) -> str:
     payload = {
         "iat": now - JWT_CLOCK_DRIFT_SECONDS,   # Issued-at (with drift buffer)
         "exp": now + JWT_EXPIRY_SECONDS,         # Expires-at (10 min max)
-        "iss": app_id,                           # Issuer = App ID
+        "iss": app_id.strip(),                  # Issuer = App ID
     }
 
     return jwt.encode(payload, private_key, algorithm=JWT_ALGORITHM)
@@ -112,18 +118,33 @@ def get_installation_id(jwt_token: str, owner: str) -> int:
         The numeric installation ID.
 
     Raises:
+        ValueError:   If parameters are invalid or response format is unexpected.
         RuntimeError: If no installation is found for the given owner.
         requests.HTTPError: If the GitHub API request fails.
     """
+    if not jwt_token or not isinstance(jwt_token, str) or not jwt_token.strip():
+        raise ValueError("jwt_token must be a non-empty string")
+
+    if not owner or not isinstance(owner, str) or not owner.strip():
+        raise ValueError("owner must be a non-empty string")
+
     url = f"{GITHUB_API_BASE}/app/installations"
-    response = requests.get(url, headers=_api_headers(jwt_token), timeout=30)
+    response = requests.get(url, headers=_api_headers(jwt_token.strip()), timeout=30)
     response.raise_for_status()
 
     installations = response.json()
+    if not isinstance(installations, list):
+        raise ValueError(
+            f"Unexpected response format from GitHub API: expected list, got {type(installations).__name__}"
+        )
 
+    owner_lower = owner.strip().lower()
     for installation in installations:
-        account_login = installation.get("account", {}).get("login", "")
-        if account_login.lower() == owner.lower():
+        if not isinstance(installation, dict):
+            continue
+        account = installation.get("account") or {}
+        account_login = account.get("login", "")
+        if account_login.lower() == owner_lower:
             return installation["id"]
 
     raise RuntimeError(
@@ -148,13 +169,24 @@ def create_installation_token(jwt_token: str, installation_id: int) -> str:
         The installation access token string.
 
     Raises:
+        ValueError: If parameters are invalid or token missing in response.
         requests.HTTPError: If the GitHub API request fails.
     """
+    if not jwt_token or not isinstance(jwt_token, str) or not jwt_token.strip():
+        raise ValueError("jwt_token must be a non-empty string")
+
+    if isinstance(installation_id, bool) or not isinstance(installation_id, int) or installation_id <= 0:
+        raise ValueError("installation_id must be a positive integer")
+
     url = f"{GITHUB_API_BASE}/app/installations/{installation_id}/access_tokens"
-    response = requests.post(url, headers=_api_headers(jwt_token), timeout=30)
+    response = requests.post(url, headers=_api_headers(jwt_token.strip()), timeout=30)
     response.raise_for_status()
 
-    return response.json()["token"]
+    data = response.json()
+    if not isinstance(data, dict) or "token" not in data or not data["token"]:
+        raise ValueError("GitHub API response did not contain an access token")
+
+    return data["token"]
 
 
 # ---------------------------------------------------------------------------
@@ -175,17 +207,29 @@ def verify_repository_access(token: str, owner: str, repo: str) -> dict:
         ``full_name``, ``owner``, ``visibility``, ``default_branch``.
 
     Raises:
+        ValueError: If parameters are invalid.
         requests.HTTPError: If the repository is not accessible.
     """
-    url = f"{GITHUB_API_BASE}/repos/{owner}/{repo}"
-    response = requests.get(url, headers=_api_headers(token), timeout=30)
+    if not token or not isinstance(token, str) or not token.strip():
+        raise ValueError("token must be a non-empty string")
+
+    if not owner or not isinstance(owner, str) or not owner.strip():
+        raise ValueError("owner must be a non-empty string")
+
+    if not repo or not isinstance(repo, str) or not repo.strip():
+        raise ValueError("repo must be a non-empty string")
+
+    url = f"{GITHUB_API_BASE}/repos/{owner.strip()}/{repo.strip()}"
+    response = requests.get(url, headers=_api_headers(token.strip()), timeout=30)
     response.raise_for_status()
 
     data = response.json()
+    owner_data = data.get("owner") or {}
 
     return {
         "full_name": data.get("full_name"),
-        "owner": data.get("owner", {}).get("login"),
+        "owner": owner_data.get("login"),
         "visibility": "private" if data.get("private") else "public",
         "default_branch": data.get("default_branch"),
     }
+
