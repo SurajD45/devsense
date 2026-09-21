@@ -1,1 +1,3 @@
-# jira integration package (placeholder — implementation pending)
+from .client import JiraClient
+
+__all__ = ["JiraClient"]
