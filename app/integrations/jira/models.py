@@ -1,6 +1,6 @@
 """Internal Jira representations used by the DevSense Jira integration."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 
@@ -13,3 +13,6 @@ class JiraIssue:
     description: Optional[str]
     status: Optional[str]
     issue_type: Optional[str]
+    priority: Optional[str] = None
+    acceptance_criteria: list[str] = field(default_factory=list)
+

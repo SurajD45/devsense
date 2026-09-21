@@ -135,11 +135,269 @@ class TestJiraParser(unittest.TestCase):
         self.assertEqual(issue.description, "Plain text")
         self.assertIsNone(issue.status)
         self.assertIsNone(issue.issue_type)
+        self.assertIsNone(issue.priority)
 
     def test_parse_requires_expected_shape(self):
         with self.assertRaises(JiraResponseError):
             parse_issue({"key": "ABC-1"})
 
+    def test_parse_priority_success(self):
+        issue = parse_issue(
+            {
+                "key": "ABC-1",
+                "fields": {
+                    "summary": "Issue with priority",
+                    "priority": {"name": "High"},
+                },
+            }
+        )
+        self.assertEqual(issue.priority, "High")
+
+    def test_parse_priority_missing(self):
+        issue = parse_issue(
+            {
+                "key": "ABC-1",
+                "fields": {
+                    "summary": "Issue without priority",
+                },
+            }
+        )
+        self.assertIsNone(issue.priority)
+
+    def test_parse_priority_null(self):
+        issue = parse_issue(
+            {
+                "key": "ABC-1",
+                "fields": {
+                    "summary": "Issue with null priority",
+                    "priority": None,
+                },
+            }
+        )
+        self.assertIsNone(issue.priority)
+
+    def test_parse_priority_invalid_name(self):
+        with self.assertRaises(JiraResponseError):
+            parse_issue(
+                {
+                    "key": "ABC-1",
+                    "fields": {
+                        "summary": "Issue with invalid priority",
+                        "priority": {"name": 123},
+                    },
+                }
+            )
+
+    def test_parse_adf_acceptance_criteria_bullet_list(self):
+        payload = {
+            "key": "DEV-101",
+            "fields": {
+                "summary": "Payment checkout validation",
+                "description": {
+                    "type": "doc",
+                    "version": 1,
+                    "content": [
+                        {
+                            "type": "heading",
+                            "attrs": {"level": 2},
+                            "content": [{"type": "text", "text": "Acceptance Criteria"}],
+                        },
+                        {
+                            "type": "bulletList",
+                            "content": [
+                                {
+                                    "type": "listItem",
+                                    "content": [
+                                        {
+                                            "type": "paragraph",
+                                            "content": [{"type": "text", "text": "AC-1: First criterion"}],
+                                        }
+                                    ],
+                                },
+                                {
+                                    "type": "listItem",
+                                    "content": [
+                                        {
+                                            "type": "paragraph",
+                                            "content": [{"type": "text", "text": "AC-2: Second criterion"}],
+                                        }
+                                    ],
+                                },
+                            ],
+                        },
+                    ],
+                },
+            },
+        }
+        issue = parse_issue(payload)
+        self.assertEqual(
+            issue.acceptance_criteria,
+            ["AC-1: First criterion", "AC-2: Second criterion"],
+        )
+
+    def test_parse_adf_acceptance_criteria_ordered_list(self):
+        payload = {
+            "key": "DEV-102",
+            "fields": {
+                "summary": "Ordered criteria",
+                "description": {
+                    "type": "doc",
+                    "version": 1,
+                    "content": [
+                        {
+                            "type": "heading",
+                            "attrs": {"level": 2},
+                            "content": [{"type": "text", "text": "Acceptance Criteria"}],
+                        },
+                        {
+                            "type": "orderedList",
+                            "content": [
+                                {
+                                    "type": "listItem",
+                                    "content": [
+                                        {
+                                            "type": "paragraph",
+                                            "content": [{"type": "text", "text": "AC-1: First criterion"}],
+                                        }
+                                    ],
+                                },
+                                {
+                                    "type": "listItem",
+                                    "content": [
+                                        {
+                                            "type": "paragraph",
+                                            "content": [{"type": "text", "text": "AC-2: Second criterion"}],
+                                        }
+                                    ],
+                                },
+                            ],
+                        },
+                    ],
+                },
+            },
+        }
+        issue = parse_issue(payload)
+        self.assertEqual(
+            issue.acceptance_criteria,
+            ["AC-1: First criterion", "AC-2: Second criterion"],
+        )
+
+    def test_parse_plain_text_acceptance_criteria(self):
+        description = (
+            "Implement payment validation.\n\n"
+            "Acceptance Criteria:\n"
+            "- AC-1: Validate card number\n"
+            "- AC-2: Validate expiry date"
+        )
+        issue = parse_issue(
+            {
+                "key": "DEV-103",
+                "fields": {
+                    "summary": "Plain text bullets",
+                    "description": description,
+                },
+            }
+        )
+        self.assertEqual(
+            issue.acceptance_criteria,
+            ["AC-1: Validate card number", "AC-2: Validate expiry date"],
+        )
+
+    def test_parse_plain_text_numbered_criteria(self):
+        description = (
+            "Acceptance Criteria:\n"
+            "1. Validate card number\n"
+            "2. Validate expiry date"
+        )
+        issue = parse_issue(
+            {
+                "key": "DEV-104",
+                "fields": {
+                    "summary": "Numbered criteria",
+                    "description": description,
+                },
+            }
+        )
+        self.assertEqual(
+            issue.acceptance_criteria,
+            ["Validate card number", "Validate expiry date"],
+        )
+
+    def test_parse_no_acceptance_criteria(self):
+        issue = parse_issue(
+            {
+                "key": "DEV-105",
+                "fields": {
+                    "summary": "Issue without criteria",
+                    "description": "Just a normal description with no AC section.",
+                },
+            }
+        )
+        self.assertEqual(issue.acceptance_criteria, [])
+
+    def test_parse_empty_or_none_description(self):
+        issue_none = parse_issue(
+            {
+                "key": "DEV-106",
+                "fields": {
+                    "summary": "None description",
+                    "description": None,
+                },
+            }
+        )
+        self.assertEqual(issue_none.acceptance_criteria, [])
+
+        issue_empty = parse_issue(
+            {
+                "key": "DEV-106",
+                "fields": {
+                    "summary": "Empty description",
+                    "description": "",
+                },
+            }
+        )
+        self.assertEqual(issue_empty.acceptance_criteria, [])
+
+    def test_parse_heading_boundary(self):
+        description = (
+            "Acceptance Criteria:\n"
+            "- AC-1: Validate card\n\n"
+            "Implementation Notes:\n"
+            "- unrelated text"
+        )
+        issue = parse_issue(
+            {
+                "key": "DEV-107",
+                "fields": {
+                    "summary": "Boundary test",
+                    "description": description,
+                },
+            }
+        )
+        self.assertEqual(issue.acceptance_criteria, ["AC-1: Validate card"])
+
+    def test_parse_preserve_explicit_identifiers(self):
+        description = (
+            "Acceptance Criteria:\n"
+            "- AC-7: Validate card\n"
+            "- AC-9: Validate expiry"
+        )
+        issue = parse_issue(
+            {
+                "key": "DEV-108",
+                "fields": {
+                    "summary": "Identifier preservation",
+                    "description": description,
+                },
+            }
+        )
+        self.assertEqual(
+            issue.acceptance_criteria,
+            ["AC-7: Validate card", "AC-9: Validate expiry"],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
+
+
