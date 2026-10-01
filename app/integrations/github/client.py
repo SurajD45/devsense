@@ -151,7 +151,7 @@ class GitHubClient:
             raise ValueError("owner must be a non-empty string")
         if not repo or not isinstance(repo, str) or not repo.strip():
             raise ValueError("repo must be a non-empty string")
-        if not isinstance(pull_number, int) or pull_number <= 0:
+        if isinstance(pull_number, bool) or not isinstance(pull_number, int) or pull_number <= 0:
             raise ValueError("pull_number must be a positive integer")
 
         owner_clean = owner.strip()
@@ -232,7 +232,7 @@ class GitHubClient:
             raise ValueError("owner must be a non-empty string")
         if not repo or not isinstance(repo, str) or not repo.strip():
             raise ValueError("repo must be a non-empty string")
-        if not isinstance(pull_number, int) or pull_number <= 0:
+        if isinstance(pull_number, bool) or not isinstance(pull_number, int) or pull_number <= 0:
             raise ValueError("pull_number must be a positive integer")
         if isinstance(max_pages, bool) or not isinstance(max_pages, int) or max_pages <= 0:
             raise ValueError("max_pages must be a positive integer")
@@ -375,7 +375,7 @@ class GitHubClient:
             raise ValueError("owner must be a non-empty string")
         if not repo or not isinstance(repo, str) or not repo.strip():
             raise ValueError("repo must be a non-empty string")
-        if not isinstance(pull_number, int) or pull_number <= 0:
+        if isinstance(pull_number, bool) or not isinstance(pull_number, int) or pull_number <= 0:
             raise ValueError("pull_number must be a positive integer")
         if isinstance(max_pages, bool) or not isinstance(max_pages, int) or max_pages <= 0:
             raise ValueError("max_pages must be a positive integer")

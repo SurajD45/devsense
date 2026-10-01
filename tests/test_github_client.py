@@ -341,6 +341,10 @@ class TestGitHubClient(unittest.TestCase):
             self.client.get_pull_request(self.owner, self.repo, 0)
         with self.assertRaises(ValueError):
             self.client.get_pull_request(self.owner, self.repo, -5)
+        with self.assertRaises(ValueError):
+            self.client.get_pull_request(self.owner, self.repo, True)
+        with self.assertRaises(ValueError):
+            self.client.get_pull_request(self.owner, self.repo, False)
 
 
 class TestGitHubClientGetPullRequestFiles(unittest.TestCase):
@@ -645,6 +649,10 @@ class TestGitHubClientGetPullRequestFiles(unittest.TestCase):
             self.client.get_pull_request_files(self.owner, self.repo, 0)
         with self.assertRaises(ValueError):
             self.client.get_pull_request_files(self.owner, self.repo, -1)
+        with self.assertRaises(ValueError):
+            self.client.get_pull_request_files(self.owner, self.repo, True)
+        with self.assertRaises(ValueError):
+            self.client.get_pull_request_files(self.owner, self.repo, False)
         with self.assertRaises(ValueError):
             self.client.get_pull_request_files(self.owner, self.repo, 1, max_pages=0)
         with self.assertRaises(ValueError):
@@ -1192,6 +1200,10 @@ class TestGitHubClientGetPullRequestCommits(unittest.TestCase):
             self.client.get_pull_request_commits(self.owner, self.repo, 0)
         with self.assertRaises(ValueError):
             self.client.get_pull_request_commits(self.owner, self.repo, -1)
+        with self.assertRaises(ValueError):
+            self.client.get_pull_request_commits(self.owner, self.repo, True)
+        with self.assertRaises(ValueError):
+            self.client.get_pull_request_commits(self.owner, self.repo, False)
         with self.assertRaises(ValueError):
             self.client.get_pull_request_commits(self.owner, self.repo, 1, max_pages=0)
         with self.assertRaises(ValueError):
