@@ -35,3 +35,12 @@ GITHUB_REPOSITORY_NAME: str = os.environ.get("GITHUB_REPOSITORY_NAME", "").strip
 # ---------------------------------------------------------------------------
 
 GITHUB_WEBHOOK_SECRET: str = os.environ.get("GITHUB_WEBHOOK_SECRET", "").strip()
+
+
+# ---------------------------------------------------------------------------
+# Jira
+# ---------------------------------------------------------------------------
+
+JIRA_BASE_URL: str = os.environ.get("JIRA_BASE_URL", "").strip().rstrip("/")
+JIRA_EMAIL: str = os.environ.get("JIRA_EMAIL", "").strip()
+JIRA_API_TOKEN: str = os.environ.get("JIRA_API_TOKEN", "").strip()
