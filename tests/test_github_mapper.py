@@ -118,6 +118,49 @@ class TestGitHubPullRequestMapper(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.mapper.to_pull_request(self.context, " ", "my-repo")
 
+    def test_rejects_empty_repository_name(self):
+        with self.assertRaisesRegex(ValueError, "repo must be a non-empty string"):
+            self.mapper.to_pull_request(self.context, "SurajD45", " ")
+
+    def test_rejects_non_list_commits(self):
+        self.context["commits"] = {}
+
+        with self.assertRaisesRegex(ValueError, "context must contain a commits list"):
+            self.mapper.to_pull_request(
+                self.context, "SurajD45", "ai-pr-investigator-demo"
+            )
+
+    def test_rejects_non_dict_entries_in_files(self):
+        self.context["files"] = [None]
+        with self.assertRaisesRegex(ValueError, "each changed file must be a dictionary"):
+            self.mapper.to_pull_request(
+                self.context, "SurajD45", "ai-pr-investigator-demo"
+            )
+
+        self.context["files"] = ["invalid-file-entry"]
+        with self.assertRaisesRegex(ValueError, "each changed file must be a dictionary"):
+            self.mapper.to_pull_request(
+                self.context, "SurajD45", "ai-pr-investigator-demo"
+            )
+
+    def test_rejects_non_dict_entries_in_commits(self):
+        self.context["commits"] = [None]
+        with self.assertRaisesRegex(ValueError, "each commit must be a dictionary"):
+            self.mapper.to_pull_request(
+                self.context, "SurajD45", "ai-pr-investigator-demo"
+            )
+
+        self.context["commits"] = [123]
+        with self.assertRaisesRegex(ValueError, "each commit must be a dictionary"):
+            self.mapper.to_pull_request(
+                self.context, "SurajD45", "ai-pr-investigator-demo"
+            )
+
+    def test_public_export_from_github_package(self):
+        from app.integrations.github import GitHubPullRequestMapper
+
+        self.assertIsNotNone(GitHubPullRequestMapper)
+
     @patch("app.integrations.github.client.requests.get")
     def test_mapping_does_not_make_network_calls(self, mock_get):
         self.mapper.to_pull_request(
