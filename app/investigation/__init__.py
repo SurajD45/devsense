@@ -4,6 +4,11 @@ DevSense — Investigation Package
 Investigation orchestration, pipeline schemas, and analysis workflows.
 """
 
+from app.investigation.pipeline import (
+    EmptyChangesetError,
+    FindingSynthesisService,
+    InvestigationPipelineOrchestrator,
+)
 from app.investigation.schemas import (
     AnalyzedCriterion,
     ChangeImpactAnalysis,
@@ -48,6 +53,7 @@ __all__ = [
     "CodeInvestigationService",
     "CodeObservation",
     "CodeObservationType",
+    "EmptyChangesetError",
     "EvidenceBuilder",
     "FileClassification",
     "FilePromotionAnalysis",
@@ -55,7 +61,9 @@ __all__ = [
     "FileReviewAnalysis",
     "FileReviewItem",
     "FileReviewPriority",
+    "FindingSynthesisService",
     "InvestigationPipelineInput",
+    "InvestigationPipelineOrchestrator",
     "InvestigationResultBundle",
     "ObservationType",
     "PrioritizedFile",
