@@ -253,6 +253,7 @@ class TestGitHubClient(unittest.TestCase):
             "html_url",
             "base_branch",
             "head_branch",
+            "head_sha",
             "created_at",
             "updated_at",
         }

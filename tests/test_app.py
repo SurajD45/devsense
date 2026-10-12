@@ -100,6 +100,42 @@ class TestExtractPRInfo(unittest.TestCase):
         self.assertEqual(info["pr_author"], "testuser")
         self.assertEqual(info["source_branch"], "feature-branch")
         self.assertEqual(info["target_branch"], "main")
+        self.assertIsNone(info["head_commit_sha"])
+
+    def test_extract_pr_info_preserves_head_commit_sha(self):
+        payload = dict(self.valid_payload)
+        payload["pull_request"] = dict(self.valid_payload["pull_request"])
+        payload["pull_request"]["head"] = {
+            "ref": "feature-branch",
+            "sha": "0123456789abcdef0123456789abcdef01234567",
+        }
+        info = extract_pr_info(payload)
+        self.assertIsNotNone(info)
+        self.assertEqual(info["head_commit_sha"], "0123456789abcdef0123456789abcdef01234567")
+
+    def test_extract_pr_info_normalizes_uppercase_sha(self):
+        payload = dict(self.valid_payload)
+        payload["pull_request"] = dict(self.valid_payload["pull_request"])
+        payload["pull_request"]["head"] = {
+            "ref": "feature-branch",
+            "sha": "ABCDEF0123456789ABCDEF0123456789ABCDEF01",
+        }
+        info = extract_pr_info(payload)
+        self.assertIsNotNone(info)
+        self.assertEqual(info["head_commit_sha"], "abcdef0123456789abcdef0123456789abcdef01")
+
+    def test_extract_pr_info_missing_or_malformed_head_sha_is_none(self):
+        for bad_sha in ["short", "123456", "not-hex!", None, "", "   "]:
+            payload = dict(self.valid_payload)
+            payload["pull_request"] = dict(self.valid_payload["pull_request"])
+            payload["pull_request"]["head"] = {
+                "ref": "feature-branch",
+                "sha": bad_sha,
+            }
+            info = extract_pr_info(payload)
+            self.assertIsNotNone(info)
+            self.assertIsNone(info["head_commit_sha"])
+
 
     def test_handled_actions_supported(self):
         for action in ["opened", "synchronize", "reopened"]:
@@ -772,6 +808,448 @@ class TestPRContextProcessingIntegration(unittest.TestCase):
         # Raw dictionary equality and JSON serialization work
         self.assertEqual(result, no_key_context)
         self.assertEqual(json.dumps(result), json.dumps(no_key_context))
+
+
+class TestPhase3HeadShaAndContentRetrieval(unittest.TestCase):
+    """Test suite for Phase 3 Step 1: Head SHA provenance & content retrieval integration."""
+
+    def setUp(self):
+        self.pr_info = {
+            "action": "opened",
+            "installation_id": 998877,
+            "owner": "SurajD45",
+            "repo": "devsense",
+            "pull_number": 10,
+            "head_commit_sha": "a1b2c3d4e5f67890a1b2c3d4e5f67890a1b2c3d4",
+        }
+        self.raw_github_context = {
+            "pull_request": {
+                "number": 10,
+                "title": "SCRUM-5 Implement user authentication",
+                "body": "Fixes SCRUM-5 by implementing JWT authentication.",
+                "author": "suraj",
+                "head_branch": "feature/auth",
+                "base_branch": "main",
+                "state": "open",
+                "head_sha": "a1b2c3d4e5f67890a1b2c3d4e5f67890a1b2c3d4",
+            },
+            "files": [
+                {
+                    "filename": "app/auth.py",
+                    "status": "modified",
+                    "additions": 42,
+                    "deletions": 0,
+                    "changes": 42,
+                    "patch": "@@ -0,0 +1,42 @@",
+                }
+            ],
+            "commits": [
+                {
+                    "sha": "a1b2c3d4e5f67890a1b2c3d4e5f67890a1b2c3d4",
+                    "message": "feat: add user authentication",
+                    "author": "suraj",
+                }
+            ],
+        }
+
+    @patch("app.main.get_jira_bridge")
+    @patch("app.main.get_installation_client")
+    def test_process_pull_request_context_retrieves_file_contents_pinned_to_head_sha(
+        self, mock_get_github_client, mock_get_jira_bridge
+    ):
+        mock_github = MagicMock()
+        mock_github.get_pull_request_context.return_value = self.raw_github_context
+        mock_get_github_client.return_value = mock_github
+
+        mock_bridge = MagicMock()
+        mock_bridge.get_requirement_for_pr.return_value = BridgeResult(
+            requirement=None,
+            jira_key=None,
+            reason="No Jira key",
+        )
+        mock_get_jira_bridge.return_value = mock_bridge
+
+        mock_content_service = MagicMock()
+        mock_batch = MagicMock()
+        mock_batch.contents = {"app/auth.py": "def authenticate(): pass"}
+        mock_batch.failures = {}
+        mock_content_service.retrieve_contents.return_value = mock_batch
+
+        result = process_pull_request_context(
+            self.pr_info,
+            content_service=mock_content_service,
+        )
+
+        self.assertIsNotNone(result)
+        self.assertEqual(
+            result.head_commit_sha,
+            "a1b2c3d4e5f67890a1b2c3d4e5f67890a1b2c3d4",
+        )
+        self.assertEqual(result.file_contents, {"app/auth.py": "def authenticate(): pass"})
+        self.assertIs(result.content_batch, mock_batch)
+
+        mock_content_service.retrieve_contents.assert_called_once_with(
+            repository="SurajD45/devsense",
+            head_commit_sha="a1b2c3d4e5f67890a1b2c3d4e5f67890a1b2c3d4",
+            changed_files=result.pull_request.changed_files,
+            client=mock_github,
+        )
+
+    @patch("app.main.get_jira_bridge")
+    @patch("app.main.get_installation_client")
+    def test_process_pull_request_context_resolves_head_sha_from_github_context_when_missing_in_pr_info(
+        self, mock_get_github_client, mock_get_jira_bridge
+    ):
+        info_without_sha = dict(self.pr_info)
+        del info_without_sha["head_commit_sha"]
+
+        mock_github = MagicMock()
+        mock_github.get_pull_request_context.return_value = self.raw_github_context
+        mock_get_github_client.return_value = mock_github
+
+        mock_bridge = MagicMock()
+        mock_bridge.get_requirement_for_pr.return_value = BridgeResult(
+            requirement=None,
+            jira_key=None,
+            reason="No Jira key",
+        )
+        mock_get_jira_bridge.return_value = mock_bridge
+
+        mock_content_service = MagicMock()
+        mock_batch = MagicMock()
+        mock_batch.contents = {"app/auth.py": "content"}
+        mock_batch.failures = {}
+        mock_content_service.retrieve_contents.return_value = mock_batch
+
+        result = process_pull_request_context(
+            info_without_sha,
+            content_service=mock_content_service,
+        )
+
+        self.assertEqual(
+            result.head_commit_sha,
+            "a1b2c3d4e5f67890a1b2c3d4e5f67890a1b2c3d4",
+        )
+        mock_content_service.retrieve_contents.assert_called_once_with(
+            repository="SurajD45/devsense",
+            head_commit_sha="a1b2c3d4e5f67890a1b2c3d4e5f67890a1b2c3d4",
+            changed_files=result.pull_request.changed_files,
+            client=mock_github,
+        )
+
+    @patch("app.main.get_jira_bridge")
+    @patch("app.main.get_installation_client")
+    def test_process_pull_request_context_prefers_live_api_sha_when_differing_and_logs_discrepancy(
+        self, mock_get_github_client, mock_get_jira_bridge
+    ):
+        webhook_info = dict(self.pr_info)
+        webhook_info["head_commit_sha"] = "1111111111111111111111111111111111111111"
+
+        live_context = dict(self.raw_github_context)
+        live_context["pull_request"] = dict(self.raw_github_context["pull_request"])
+        live_context["pull_request"]["head_sha"] = "2222222222222222222222222222222222222222"
+
+        mock_github = MagicMock()
+        mock_github.get_pull_request_context.return_value = live_context
+        mock_get_github_client.return_value = mock_github
+
+        mock_bridge = MagicMock()
+        mock_bridge.get_requirement_for_pr.return_value = BridgeResult(
+            requirement=None,
+            jira_key=None,
+            reason="No Jira key",
+        )
+        mock_get_jira_bridge.return_value = mock_bridge
+
+        mock_content_service = MagicMock()
+        mock_batch = MagicMock()
+        mock_batch.contents = {"app/auth.py": "content"}
+        mock_batch.failures = {}
+        mock_content_service.retrieve_contents.return_value = mock_batch
+
+        with self.assertLogs("server", level="WARNING") as log_cm:
+            result = process_pull_request_context(
+                webhook_info,
+                content_service=mock_content_service,
+            )
+
+        self.assertEqual(
+            result.head_commit_sha,
+            "2222222222222222222222222222222222222222",
+        )
+        mock_content_service.retrieve_contents.assert_called_once_with(
+            repository="SurajD45/devsense",
+            head_commit_sha="2222222222222222222222222222222222222222",
+            changed_files=result.pull_request.changed_files,
+            client=mock_github,
+        )
+
+        # Verify discrepancy diagnostic log records repository, PR number, short prefixes, and selection
+        discrepancy_log = [
+            msg for msg in log_cm.output if "PR head discrepancy" in msg
+        ]
+        self.assertTrue(discrepancy_log, "Discrepancy log should be emitted")
+        self.assertIn("SurajD45/devsense PR #10", discrepancy_log[0])
+        self.assertIn("1111111", discrepancy_log[0])
+        self.assertIn("2222222", discrepancy_log[0])
+        self.assertIn("selected live GitHub head", discrepancy_log[0])
+
+    @patch("app.main.get_jira_bridge")
+    @patch("app.main.get_installation_client")
+    def test_process_pull_request_context_skips_retrieval_when_live_sha_missing_even_with_valid_webhook_sha(
+        self, mock_get_github_client, mock_get_jira_bridge
+    ):
+        webhook_info = dict(self.pr_info)
+        webhook_info["head_commit_sha"] = "3333333333333333333333333333333333333333"
+
+        live_context = dict(self.raw_github_context)
+        live_context["pull_request"] = dict(self.raw_github_context["pull_request"])
+        del live_context["pull_request"]["head_sha"]
+
+        mock_github = MagicMock()
+        mock_github.get_pull_request_context.return_value = live_context
+        mock_get_github_client.return_value = mock_github
+
+        mock_bridge = MagicMock()
+        mock_bridge.get_requirement_for_pr.return_value = BridgeResult(
+            requirement=None,
+            jira_key=None,
+            reason="No Jira key",
+        )
+        mock_get_jira_bridge.return_value = mock_bridge
+
+        mock_content_service = MagicMock()
+
+        with self.assertLogs("server", level="WARNING") as log_cm:
+            result = process_pull_request_context(
+                webhook_info,
+                content_service=mock_content_service,
+            )
+
+        self.assertIsNone(result.head_commit_sha)
+        self.assertEqual(result.file_contents, {})
+        self.assertIsNone(result.content_batch)
+        mock_content_service.retrieve_contents.assert_not_called()
+
+        warning_log = [
+            msg for msg in log_cm.output if "Live GitHub PR head SHA is unavailable" in msg
+        ]
+        self.assertTrue(warning_log, "Warning log should be emitted")
+        self.assertIn("SurajD45/devsense PR #10", warning_log[0])
+        self.assertIn("3333333", warning_log[0])
+        self.assertIn("guarantee snapshot consistency", warning_log[0])
+
+    @patch("app.main.get_jira_bridge")
+    @patch("app.main.get_installation_client")
+    def test_process_pull_request_context_skips_retrieval_when_live_sha_malformed_even_with_valid_webhook_sha(
+        self, mock_get_github_client, mock_get_jira_bridge
+    ):
+        webhook_info = dict(self.pr_info)
+        webhook_info["head_commit_sha"] = "4444444444444444444444444444444444444444"
+
+        live_context = dict(self.raw_github_context)
+        live_context["pull_request"] = dict(self.raw_github_context["pull_request"])
+        live_context["pull_request"]["head_sha"] = "not-a-valid-hex-sha"
+
+        mock_github = MagicMock()
+        mock_github.get_pull_request_context.return_value = live_context
+        mock_get_github_client.return_value = mock_github
+
+        mock_bridge = MagicMock()
+        mock_bridge.get_requirement_for_pr.return_value = BridgeResult(
+            requirement=None,
+            jira_key=None,
+            reason="No Jira key",
+        )
+        mock_get_jira_bridge.return_value = mock_bridge
+
+        mock_content_service = MagicMock()
+
+        result = process_pull_request_context(
+            webhook_info,
+            content_service=mock_content_service,
+        )
+
+        self.assertIsNone(result.head_commit_sha)
+        self.assertEqual(result.file_contents, {})
+        self.assertIsNone(result.content_batch)
+        mock_content_service.retrieve_contents.assert_not_called()
+
+    @patch("app.main.get_jira_bridge")
+    @patch("app.main.get_installation_client")
+    def test_process_pull_request_context_skips_retrieval_when_neither_source_provides_valid_sha(
+        self, mock_get_github_client, mock_get_jira_bridge
+    ):
+        webhook_info = dict(self.pr_info)
+        webhook_info["head_commit_sha"] = "malformed-webhook-sha"
+
+        live_context = dict(self.raw_github_context)
+        live_context["pull_request"] = dict(self.raw_github_context["pull_request"])
+        live_context["pull_request"]["head_sha"] = "malformed-live-sha"
+
+        mock_github = MagicMock()
+        mock_github.get_pull_request_context.return_value = live_context
+        mock_get_github_client.return_value = mock_github
+
+        mock_bridge = MagicMock()
+        mock_bridge.get_requirement_for_pr.return_value = BridgeResult(
+            requirement=None,
+            jira_key=None,
+            reason="No Jira key",
+        )
+        mock_get_jira_bridge.return_value = mock_bridge
+
+        mock_content_service = MagicMock()
+
+        result = process_pull_request_context(
+            webhook_info,
+            content_service=mock_content_service,
+        )
+
+        self.assertIsNone(result.head_commit_sha)
+        self.assertEqual(result.file_contents, {})
+        self.assertIsNone(result.content_batch)
+        mock_content_service.retrieve_contents.assert_not_called()
+
+    @patch("app.main.get_jira_bridge")
+    @patch("app.main.get_installation_client")
+    def test_process_pull_request_context_fails_closed_when_head_sha_missing(
+        self, mock_get_github_client, mock_get_jira_bridge
+    ):
+        info_without_sha = dict(self.pr_info)
+        del info_without_sha["head_commit_sha"]
+
+        context_without_sha = dict(self.raw_github_context)
+        context_without_sha["pull_request"] = dict(self.raw_github_context["pull_request"])
+        del context_without_sha["pull_request"]["head_sha"]
+
+        mock_github = MagicMock()
+        mock_github.get_pull_request_context.return_value = context_without_sha
+        mock_get_github_client.return_value = mock_github
+
+        mock_bridge = MagicMock()
+        mock_bridge.get_requirement_for_pr.return_value = BridgeResult(
+            requirement=None,
+            jira_key=None,
+            reason="No Jira key",
+        )
+        mock_get_jira_bridge.return_value = mock_bridge
+
+        mock_content_service = MagicMock()
+
+        result = process_pull_request_context(
+            info_without_sha,
+            content_service=mock_content_service,
+        )
+
+        self.assertIsNone(result.head_commit_sha)
+        self.assertEqual(result.file_contents, {})
+        self.assertIsNone(result.content_batch)
+        mock_content_service.retrieve_contents.assert_not_called()
+
+    @patch("app.main.get_jira_bridge")
+    @patch("app.main.get_installation_client")
+    def test_process_pull_request_context_fails_closed_when_head_sha_malformed(
+        self, mock_get_github_client, mock_get_jira_bridge
+    ):
+        info_bad_sha = dict(self.pr_info)
+        info_bad_sha["head_commit_sha"] = "not-a-valid-sha"
+
+        context_without_sha = dict(self.raw_github_context)
+        context_without_sha["pull_request"] = dict(self.raw_github_context["pull_request"])
+        del context_without_sha["pull_request"]["head_sha"]
+
+        mock_github = MagicMock()
+        mock_github.get_pull_request_context.return_value = context_without_sha
+        mock_get_github_client.return_value = mock_github
+
+        mock_content_service = MagicMock()
+
+        result = process_pull_request_context(
+            info_bad_sha,
+            content_service=mock_content_service,
+        )
+
+        self.assertIsNone(result.head_commit_sha)
+        self.assertEqual(result.file_contents, {})
+        self.assertIsNone(result.content_batch)
+        mock_content_service.retrieve_contents.assert_not_called()
+
+    @patch("app.main.get_jira_bridge")
+    @patch("app.main.get_installation_client")
+    def test_process_pull_request_context_handles_deleted_binary_and_failed_files(
+        self, mock_get_github_client, mock_get_jira_bridge
+    ):
+        context_mixed_files = dict(self.raw_github_context)
+        context_mixed_files["files"] = [
+            {"filename": "app/valid.py", "status": "modified"},
+            {"filename": "old/deleted.py", "status": "removed"},
+            {"filename": "assets/logo.png", "status": "added"},
+        ]
+
+        mock_github = MagicMock()
+        mock_github.get_pull_request_context.return_value = context_mixed_files
+        mock_github.get_file_content.return_value = "print('valid code')"
+        mock_get_github_client.return_value = mock_github
+
+        mock_bridge = MagicMock()
+        mock_bridge.get_requirement_for_pr.return_value = BridgeResult(
+            requirement=None,
+            jira_key=None,
+            reason="No Jira key",
+        )
+        mock_get_jira_bridge.return_value = mock_bridge
+
+        result = process_pull_request_context(self.pr_info)
+
+        self.assertEqual(result.file_contents, {"app/valid.py": "print('valid code')"})
+        self.assertNotIn("old/deleted.py", result.file_contents)
+        self.assertNotIn("assets/logo.png", result.file_contents)
+        self.assertEqual(
+            result.content_batch.results["old/deleted.py"].status.value,
+            "DELETED",
+        )
+        self.assertEqual(
+            result.content_batch.results["assets/logo.png"].status.value,
+            "BINARY",
+        )
+
+    @patch("app.main.get_jira_bridge")
+    @patch("app.main.get_installation_client")
+    def test_processed_pr_context_preserves_dict_equality_and_json_serialization(
+        self, mock_get_github_client, mock_get_jira_bridge
+    ):
+        mock_github = MagicMock()
+        mock_github.get_pull_request_context.return_value = self.raw_github_context
+        mock_github.get_file_content.return_value = "def auth(): pass"
+        mock_get_github_client.return_value = mock_github
+
+        mock_bridge = MagicMock()
+        mock_bridge.get_requirement_for_pr.return_value = BridgeResult(
+            requirement=None,
+            jira_key=None,
+            reason="No Jira key",
+        )
+        mock_get_jira_bridge.return_value = mock_bridge
+
+        result = process_pull_request_context(self.pr_info)
+
+        # Dictionary payload equality with raw context
+        self.assertEqual(result, self.raw_github_context)
+        self.assertEqual(result.raw_context, self.raw_github_context)
+
+        # JSON serialization matches raw context JSON
+        self.assertEqual(json.dumps(result), json.dumps(self.raw_github_context))
+
+        # Attributes exist and are not dictionary keys
+        self.assertIn("app/auth.py", result.file_contents)
+        self.assertEqual(
+            result.head_commit_sha,
+            "a1b2c3d4e5f67890a1b2c3d4e5f67890a1b2c3d4",
+        )
+        self.assertNotIn("head_commit_sha", result)
+        self.assertNotIn("file_contents", result)
+        self.assertNotIn("content_batch", result)
 
 
 if __name__ == "__main__":

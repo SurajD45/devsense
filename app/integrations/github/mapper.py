@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import re
+
 from app.domain.models import ChangedFile, Commit, PullRequest
+
+_HEX_SHA_PATTERN = re.compile(r"^[0-9a-fA-F]{7,40}$")
 
 
 class GitHubPullRequestMapper:
@@ -60,6 +64,15 @@ class GitHubPullRequestMapper:
         if not all(isinstance(item, dict) for item in commits_data):
             raise ValueError("each commit must be a dictionary")
 
+        raw_head_sha = pr_data.get("head_sha")
+        if raw_head_sha is None and isinstance(pr_data.get("head"), dict):
+            raw_head_sha = pr_data.get("head", {}).get("sha")
+        head_sha: str | None = None
+        if isinstance(raw_head_sha, str):
+            cleaned_sha = raw_head_sha.strip()
+            if cleaned_sha and _HEX_SHA_PATTERN.fullmatch(cleaned_sha):
+                head_sha = cleaned_sha.lower()
+
         changed_files = [
             ChangedFile(
                 path=item.get("filename"),
@@ -89,6 +102,7 @@ class GitHubPullRequestMapper:
             source_branch=pr_data.get("head_branch"),
             target_branch=pr_data.get("base_branch"),
             state=pr_data.get("state"),
+            head_sha=head_sha,
             commits=commits,
             changed_files=changed_files,
         )

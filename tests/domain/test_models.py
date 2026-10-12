@@ -183,6 +183,48 @@ class TestPullRequestModel(unittest.TestCase):
         )
         self.assertEqual(pr.description, "detailed description")
 
+    def test_valid_head_sha_accepted_and_lowercased(self):
+        pr = PullRequest(
+            repository="owner/repo",
+            number=1,
+            title="title",
+            author="alice",
+            source_branch="feat",
+            target_branch="main",
+            state="open",
+            head_sha="ABCDEF1234567890ABCDEF1234567890ABCDEF12",
+        )
+        self.assertEqual(pr.head_sha, "abcdef1234567890abcdef1234567890abcdef12")
+
+    def test_optional_head_sha_defaults_to_none(self):
+        pr = PullRequest(
+            repository="owner/repo",
+            number=1,
+            title="title",
+            author="alice",
+            source_branch="feat",
+            target_branch="main",
+            state="open",
+        )
+        self.assertIsNone(pr.head_sha)
+
+    def test_invalid_head_sha_rejected(self):
+        invalid_shas = ["short", "123456", "not-hex-characters!", "g" * 40, " " * 10]
+        for bad_sha in invalid_shas:
+            with self.subTest(bad_sha=bad_sha):
+                with self.assertRaises(ValidationError):
+                    PullRequest(
+                        repository="owner/repo",
+                        number=1,
+                        title="title",
+                        author="alice",
+                        source_branch="feat",
+                        target_branch="main",
+                        state="open",
+                        head_sha=bad_sha,
+                    )
+
+
     def test_default_empty_commits_and_changed_files(self):
         pr1 = PullRequest(
             repository="owner/repo",

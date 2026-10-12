@@ -169,6 +169,34 @@ class TestGitHubPullRequestMapper(unittest.TestCase):
 
         mock_get.assert_not_called()
 
+    def test_maps_head_sha_when_present_in_context(self):
+        self.context["pull_request"]["head_sha"] = "0123456789abcdef0123456789abcdef01234567"
+        result = self.mapper.to_pull_request(
+            self.context, "SurajD45", "ai-pr-investigator-demo"
+        )
+        self.assertEqual(result.head_sha, "0123456789abcdef0123456789abcdef01234567")
+
+    def test_maps_head_sha_from_nested_head_object(self):
+        self.context["pull_request"]["head"] = {"sha": "ABCDEF1234567890ABCDEF1234567890ABCDEF12"}
+        result = self.mapper.to_pull_request(
+            self.context, "SurajD45", "ai-pr-investigator-demo"
+        )
+        self.assertEqual(result.head_sha, "abcdef1234567890abcdef1234567890abcdef12")
+
+    def test_omits_head_sha_when_absent_or_invalid(self):
+        # Absent
+        result = self.mapper.to_pull_request(
+            self.context, "SurajD45", "ai-pr-investigator-demo"
+        )
+        self.assertIsNone(result.head_sha)
+
+        # Invalid format
+        self.context["pull_request"]["head_sha"] = "not-a-sha"
+        result2 = self.mapper.to_pull_request(
+            self.context, "SurajD45", "ai-pr-investigator-demo"
+        )
+        self.assertIsNone(result2.head_sha)
+
 
 if __name__ == "__main__":
     unittest.main()
