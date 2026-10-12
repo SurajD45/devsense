@@ -16,7 +16,14 @@ from enum import Enum
 from typing import Any
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-from app.domain.models import Evidence
+from app.domain.models import (
+    Evidence,
+    Finding,
+    Investigation,
+    InvestigationStatus,
+    PullRequest,
+    Requirement,
+)
 
 # ---------------------------------------------------------------------------
 # Validation Helpers & Patterns
@@ -24,6 +31,8 @@ from app.domain.models import Evidence
 
 _CRITERION_ID_PATTERN = re.compile(r"^AC-[0-9]+$")
 _EVIDENCE_ID_PATTERN = re.compile(r"^EV-[0-9]+$")
+_FINDING_ID_PATTERN = re.compile(r"^FIND-[0-9]+$")
+_INVESTIGATION_ID_PATTERN = re.compile(r"^INV-[0-9]+$")
 _PATH_SEPARATORS_PATTERN = re.compile(r"[/\\]")
 
 # Known file extensions to catch direct repository file references (e.g. "auth.py")
@@ -658,5 +667,195 @@ class CodeEvidenceBuildResult(BaseModel):
         return self.evidence[index]
 
 
+# ---------------------------------------------------------------------------
+# InvestigationPipelineInput
+# ---------------------------------------------------------------------------
+
+class InvestigationPipelineInput(BaseModel):
+    """
+    Structured input contract for the deterministic investigation pipeline.
+
+    Encapsulates all necessary inputs required by the pipeline stages:
+    - The normalized pull request to be investigated.
+    - The linked specification requirement containing acceptance criteria.
+    - An optional in-memory mapping of repository file paths to file contents.
+    - An optional explicit investigation identifier.
+    """
+
+    pull_request: PullRequest
+    requirement: Requirement
+    file_contents: dict[str, str] = Field(default_factory=dict)
+    investigation_id: str | None = None
+
+    @field_validator("investigation_id")
+    @classmethod
+    def _validate_investigation_id(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        cleaned = _validate_non_empty_str(value, "investigation_id")
+        if not _INVESTIGATION_ID_PATTERN.fullmatch(cleaned):
+            raise ValueError(
+                f"investigation_id '{value}' is invalid; "
+                "must match pattern 'INV-<number>' (e.g. 'INV-1', 'INV-42')"
+            )
+        return cleaned
+
+    @field_validator("file_contents")
+    @classmethod
+    def _validate_file_contents(cls, value: dict[str, str]) -> dict[str, str]:
+        validated: dict[str, str] = {}
+        for file_path, content in value.items():
+            cleaned_path = _validate_non_empty_str(file_path, "file_contents key")
+            if not isinstance(content, str):
+                raise ValueError(f"Content for file '{file_path}' must be a string")
+            if cleaned_path in validated:
+                raise ValueError(
+                    f"Duplicate or colliding file path '{cleaned_path}' in file_contents"
+                )
+            validated[cleaned_path] = content
+        return validated
+
+    @field_validator("requirement")
+    @classmethod
+    def _validate_requirement_criteria(cls, value: Requirement) -> Requirement:
+        if not value.acceptance_criteria:
+            raise ValueError(
+                "requirement must contain at least one AcceptanceCriterion for investigation"
+            )
+        return value
 
 
+# ---------------------------------------------------------------------------
+# InvestigationResultBundle
+# ---------------------------------------------------------------------------
+
+class InvestigationResultBundle(BaseModel):
+    """
+    Structured output bundle produced by the deterministic investigation pipeline.
+
+    Ties together the final orchestration Investigation domain record, the generated
+    Findings, and the referenced concrete Evidence artifacts, while retaining optional
+    intermediate stage analysis outputs for full auditability and explainability.
+    """
+
+    investigation: Investigation
+    findings: list[Finding] = Field(default_factory=list)
+    evidence: list[Evidence] = Field(default_factory=list)
+
+    # Optional intermediate stage outputs for full pipeline observability
+    requirement_analysis: RequirementAnalysis | None = None
+    impact_analysis: ChangeImpactAnalysis | None = None
+    promotion_analysis: FilePromotionAnalysis | None = None
+    code_investigation_results: list[CodeInvestigationResult] = Field(default_factory=list)
+    evidence_build_result: CodeEvidenceBuildResult | None = None
+
+    # Execution / diagnostic errors
+    errors: list[str] = Field(default_factory=list)
+
+    @field_validator("errors")
+    @classmethod
+    def _validate_errors(cls, values: list[str]) -> list[str]:
+        cleaned: list[str] = []
+        for i, err in enumerate(values):
+            cleaned.append(_validate_non_empty_str(err, f"errors[{i}]"))
+        return cleaned
+
+    @field_validator("findings")
+    @classmethod
+    def _validate_findings(cls, values: list[Finding]) -> list[Finding]:
+        seen_ids: set[str] = set()
+        for f in values:
+            if not isinstance(f, Finding):
+                raise TypeError(f"Expected Finding instance, got {type(f).__name__}")
+            if f.finding_id in seen_ids:
+                raise ValueError(f"Duplicate finding_id '{f.finding_id}' in findings")
+            seen_ids.add(f.finding_id)
+        return values
+
+    @field_validator("evidence")
+    @classmethod
+    def _validate_evidence(cls, values: list[Evidence]) -> list[Evidence]:
+        seen_ids: set[str] = set()
+        for ev in values:
+            if not isinstance(ev, Evidence):
+                raise TypeError(f"Expected Evidence instance, got {type(ev).__name__}")
+            if ev.evidence_id in seen_ids:
+                raise ValueError(f"Duplicate evidence_id '{ev.evidence_id}' in evidence")
+            seen_ids.add(ev.evidence_id)
+        return values
+
+    @field_validator("code_investigation_results")
+    @classmethod
+    def _validate_code_investigation_results(
+        cls, values: list[CodeInvestigationResult]
+    ) -> list[CodeInvestigationResult]:
+        seen_paths: set[str] = set()
+        for res in values:
+            if not isinstance(res, CodeInvestigationResult):
+                raise TypeError(f"Expected CodeInvestigationResult, got {type(res).__name__}")
+            if res.file_path in seen_paths:
+                raise ValueError(
+                    f"Duplicate file_path '{res.file_path}' in code_investigation_results"
+                )
+            seen_paths.add(res.file_path)
+        return values
+
+    @model_validator(mode="after")
+    def _validate_bundle_integrity(self) -> "InvestigationResultBundle":
+        # 1. Failure behavior: require meaningful errors for FAILED investigations
+        if self.investigation.status == InvestigationStatus.FAILED:
+            if not self.errors:
+                raise ValueError(
+                    "Investigation with status FAILED must include at least one error message in 'errors'"
+                )
+
+        # 2. Finding IDs integrity: check for duplicate finding_ids and exact list correspondence
+        if len(self.investigation.finding_ids) != len(set(self.investigation.finding_ids)):
+            raise ValueError(
+                f"Duplicate finding_ids found in investigation.finding_ids: {self.investigation.finding_ids}"
+            )
+
+        finding_ids_in_list = [f.finding_id for f in self.findings]
+        if self.investigation.finding_ids != finding_ids_in_list:
+            if set(self.investigation.finding_ids) == set(finding_ids_in_list):
+                raise ValueError(
+                    f"Order mismatch between investigation.finding_ids ({self.investigation.finding_ids}) "
+                    f"and findings list IDs ({finding_ids_in_list})"
+                )
+            raise ValueError(
+                f"Mismatch between investigation.finding_ids ({self.investigation.finding_ids}) "
+                f"and findings list IDs ({finding_ids_in_list})"
+            )
+
+        # 3. Evidence referential integrity: Every evidence_id in findings must exist in evidence
+        available_evidence_ids = {ev.evidence_id for ev in self.evidence}
+        for finding in self.findings:
+            if len(finding.evidence_ids) != len(set(finding.evidence_ids)):
+                raise ValueError(
+                    f"Finding '{finding.finding_id}' contains duplicate evidence_ids: {finding.evidence_ids}"
+                )
+            for ev_id in finding.evidence_ids:
+                if ev_id not in available_evidence_ids:
+                    raise ValueError(
+                        f"Finding '{finding.finding_id}' references unknown evidence_id '{ev_id}' "
+                        f"not present in bundle evidence list"
+                    )
+
+        # 4. Traceability with evidence_build_result if provided
+        if self.evidence_build_result is not None:
+            build_result_ev_ids = {ev.evidence_id for ev in self.evidence_build_result.evidence}
+            if not build_result_ev_ids.issubset(available_evidence_ids):
+                missing = build_result_ev_ids - available_evidence_ids
+                raise ValueError(
+                    f"Bundle evidence list is missing evidence IDs from evidence_build_result: {missing}"
+                )
+
+        return self
+
+    @property
+    def investigation_id(self) -> str:
+        return self.investigation.investigation_id
+
+    @property
+    def is_successful(self) -> bool:
+        return self.investigation.status == InvestigationStatus.COMPLETED
