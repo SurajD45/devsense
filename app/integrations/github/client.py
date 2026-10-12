@@ -10,6 +10,7 @@ Security:
 """
 
 import base64
+import binascii
 import logging
 from urllib.parse import quote
 
@@ -642,6 +643,12 @@ class GitHubClient:
             if encoding == "base64" and raw_content is not None:
                 try:
                     content_bytes = base64.b64decode(raw_content)
+                except (binascii.Error, ValueError) as exc:
+                    raise GitHubAPIError(
+                        f"File '{path_clean}' contains malformed or invalid Base64 content"
+                    ) from exc
+
+                try:
                     return content_bytes.decode("utf-8")
                 except UnicodeDecodeError as exc:
                     raise GitHubAPIError(

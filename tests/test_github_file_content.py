@@ -343,6 +343,58 @@ class TestGitHubFileContentService(unittest.TestCase):
         self.assertNotIn("docs/old.md", batch.contents)
         self.assertEqual(batch.results["docs/old.md"].status, FileContentStatus.DELETED)
 
+    def test_empty_file_retrieved_successfully(self) -> None:
+        """A valid empty text file returns content='' with SUCCESS, not None."""
+        changed_files = [
+            ChangedFile(path="app/__init__.py", status="added", additions=0, deletions=0, changes=0)
+        ]
+        self.mock_client.get_file_content.return_value = ""
+
+        batch = self.service.retrieve_contents(
+            repository=self.repository,
+            head_commit_sha=self.head_sha,
+            changed_files=changed_files,
+        )
+
+        res = batch.results["app/__init__.py"]
+        self.assertEqual(res.status, FileContentStatus.SUCCESS)
+        self.assertEqual(res.content, "")
+        self.assertTrue(res.is_success)
+        self.assertEqual(res.size_bytes, 0)
+        # Empty text files must be included in batch.contents with value ""
+        self.assertIn("app/__init__.py", batch.contents)
+        self.assertEqual(batch.contents["app/__init__.py"], "")
+        self.assertTrue("app/__init__.py" in batch)
+        self.assertEqual(batch["app/__init__.py"], "")
+        self.assertEqual(batch.get("app/__init__.py"), "")
+        self.assertEqual(len(batch.failures), 0)
+
+    def test_renamed_file_retrieved_using_new_path(self) -> None:
+        """Renamed files are retrieved using their new path at the PR head commit."""
+        changed_files = [
+            ChangedFile(
+                path="app/services/new_auth.py",
+                status="renamed",
+                additions=2,
+                deletions=1,
+                changes=3,
+            )
+        ]
+        self.mock_client.get_file_content.return_value = "new_auth_content"
+
+        batch = self.service.retrieve_contents(
+            repository=self.repository,
+            head_commit_sha=self.head_sha,
+            changed_files=changed_files,
+        )
+
+        self.mock_client.get_file_content.assert_called_once_with(
+            "SurajD45", "ai-pr-investigator-demo", "app/services/new_auth.py", ref=self.head_sha
+        )
+        self.assertEqual(batch.contents["app/services/new_auth.py"], "new_auth_content")
+        self.assertEqual(batch.results["app/services/new_auth.py"].status, FileContentStatus.SUCCESS)
+
+
 
 class TestGitHubClientGetFileContent(unittest.TestCase):
     """Unit tests for GitHubClient.get_file_content method."""
@@ -464,6 +516,27 @@ class TestGitHubClientGetFileContent(unittest.TestCase):
         mock_get.assert_called_once()
         called_url = mock_get.call_args[0][0]
         self.assertIn("contents/app/deeply/nested/my%20file%20%231.py", called_url)
+
+    @patch("app.integrations.github.client.requests.get")
+    def test_malformed_base64_raises_github_api_error(self, mock_get: MagicMock) -> None:
+        """Malformed or unpadded base64 raises GitHubAPIError without exposing content."""
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {
+            "type": "file",
+            "encoding": "base64",
+            "content": "%%%NOT-VALID-BASE64%%%",
+        }
+        mock_get.return_value = mock_resp
+
+        with self.assertRaises(GitHubAPIError) as ctx:
+            self.client.get_file_content(self.owner, self.repo, self.path, ref=self.ref)
+
+        err_msg = str(ctx.exception)
+        self.assertIn("Base64", err_msg)
+        self.assertIn("app/main.py", err_msg)
+        # Content itself must NOT be leaked in error message
+        self.assertNotIn("%%%NOT-VALID-BASE64%%%", err_msg)
 
 
 if __name__ == "__main__":

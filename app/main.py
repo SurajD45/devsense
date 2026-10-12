@@ -46,6 +46,7 @@ from app.integrations.jira.client import (
     JiraIssueNotFoundError,
     JiraNetworkError,
 )
+from app.integrations.jira.key_extractor import extract_jira_key
 from app.integrations.jira.mapper import JiraRequirementMapper
 from app.settings import GITHUB_WEBHOOK_SECRET, JIRA_BASE_URL
 
@@ -105,9 +106,16 @@ class ProcessedPRContext(dict):
     """
     Result of PR context retrieval, mapping, and Jira requirement resolution.
 
-    Inherits from dict for backward compatibility with callers and tests expecting
+    Inherits from dict for full backward compatibility with callers and tests expecting
     the raw GitHub context dictionary, while exposing the mapped PullRequest and
-    BridgeResult models via attributes and dictionary keys.
+    BridgeResult models via attributes and the raw_context property.
+
+    Design Decision:
+      The underlying dictionary contains strictly the original raw GitHub context fields,
+      preserving raw payload dictionary equality (context == raw_context) and JSON
+      serialization compatibility (json.dumps(context)). Mapped domain models (PullRequest,
+      BridgeResult) are exposed explicitly as attributes and properties, preventing domain
+      models from contaminating raw dictionary keys or breaking JSON serializers.
     """
 
     def __init__(
@@ -119,19 +127,11 @@ class ProcessedPRContext(dict):
         super().__init__(raw_context)
         self.pull_request = pull_request
         self.bridge_result = bridge_result
-        if pull_request is not None:
-            self["pull_request_model"] = pull_request
-        if bridge_result is not None:
-            self["bridge_result"] = bridge_result
 
     @property
     def raw_context(self) -> dict:
-        """Returns the original raw GitHub context without DevSense additions."""
-        return {
-            k: v
-            for k, v in self.items()
-            if k not in ("pull_request_model", "bridge_result")
-        }
+        """Returns the original raw GitHub context dictionary."""
+        return dict(self)
 
 
 
@@ -213,75 +213,91 @@ def process_pull_request_context(
         # Step 3: Resolve Jira requirement via GitHubJiraBridge
         bridge_result: BridgeResult | None = None
         if pull_request is not None:
-            try:
-                jira_bridge = bridge or get_jira_bridge()
-                bridge_result = jira_bridge.get_requirement_for_pr(
-                    pr_title=pull_request.title,
-                    pr_body=pull_request.description,
+            # Check whether a Jira key is present before constructing JiraClient/Bridge
+            jira_key = extract_jira_key(pull_request.title, pull_request.description)
+            if jira_key is None and bridge is None:
+                bridge_result = BridgeResult(
+                    requirement=None,
+                    jira_key=None,
+                    reason="No Jira key found in PR title or body.",
                 )
-                if bridge_result.has_requirement:
-                    logger.info(
-                        "Jira requirement resolved for %s/%s PR #%d: requirement_id=%s",
+                logger.info(
+                    "No Jira requirement resolved for %s/%s PR #%d: %s",
+                    owner,
+                    repo,
+                    pull_number,
+                    bridge_result.reason,
+                )
+            else:
+                try:
+                    jira_bridge = bridge or get_jira_bridge()
+                    bridge_result = jira_bridge.get_requirement_for_pr(
+                        pr_title=pull_request.title,
+                        pr_body=pull_request.description,
+                    )
+                    if bridge_result.has_requirement:
+                        logger.info(
+                            "Jira requirement resolved for %s/%s PR #%d: requirement_id=%s",
+                            owner,
+                            repo,
+                            pull_number,
+                            bridge_result.requirement.requirement_id,
+                        )
+                    else:
+                        logger.info(
+                            "No Jira requirement resolved for %s/%s PR #%d: %s",
+                            owner,
+                            repo,
+                            pull_number,
+                            bridge_result.reason,
+                        )
+                except JiraAuthenticationError:
+                    logger.error(
+                        "Jira authentication failed while resolving requirement for %s/%s PR #%d",
                         owner,
                         repo,
                         pull_number,
-                        bridge_result.requirement.requirement_id,
                     )
-                else:
-                    logger.info(
-                        "No Jira requirement resolved for %s/%s PR #%d: %s",
+                except JiraIssueNotFoundError as exc:
+                    logger.warning(
+                        "Jira issue not found for %s/%s PR #%d: %s",
                         owner,
                         repo,
                         pull_number,
-                        bridge_result.reason,
+                        exc,
                     )
-            except JiraAuthenticationError:
-                logger.error(
-                    "Jira authentication failed while resolving requirement for %s/%s PR #%d",
-                    owner,
-                    repo,
-                    pull_number,
-                )
-            except JiraIssueNotFoundError as exc:
-                logger.warning(
-                    "Jira issue not found for %s/%s PR #%d: %s",
-                    owner,
-                    repo,
-                    pull_number,
-                    exc,
-                )
-            except JiraNetworkError as exc:
-                logger.error(
-                    "Network error communicating with Jira API for %s/%s PR #%d: %s",
-                    owner,
-                    repo,
-                    pull_number,
-                    exc,
-                )
-            except JiraConfigurationError as exc:
-                logger.warning(
-                    "Jira configuration unavailable while resolving requirement for %s/%s PR #%d: %s",
-                    owner,
-                    repo,
-                    pull_number,
-                    exc,
-                )
-            except JiraClientError as exc:
-                logger.error(
-                    "Jira API error for %s/%s PR #%d: %s",
-                    owner,
-                    repo,
-                    pull_number,
-                    exc,
-                )
-            except Exception as exc:
-                logger.error(
-                    "Unexpected error while resolving Jira requirement for %s/%s PR #%d: %s",
-                    owner,
-                    repo,
-                    pull_number,
-                    type(exc).__name__,
-                )
+                except JiraNetworkError as exc:
+                    logger.error(
+                        "Network error communicating with Jira API for %s/%s PR #%d: %s",
+                        owner,
+                        repo,
+                        pull_number,
+                        exc,
+                    )
+                except JiraConfigurationError as exc:
+                    logger.warning(
+                        "Jira configuration unavailable while resolving requirement for %s/%s PR #%d: %s",
+                        owner,
+                        repo,
+                        pull_number,
+                        exc,
+                    )
+                except JiraClientError as exc:
+                    logger.error(
+                        "Jira API error for %s/%s PR #%d: %s",
+                        owner,
+                        repo,
+                        pull_number,
+                        exc,
+                    )
+                except Exception as exc:
+                    logger.error(
+                        "Unexpected error while resolving Jira requirement for %s/%s PR #%d: %s",
+                        owner,
+                        repo,
+                        pull_number,
+                        type(exc).__name__,
+                    )
 
         # Step 4: Make resulting PullRequest and BridgeResult available to next stage
         return ProcessedPRContext(

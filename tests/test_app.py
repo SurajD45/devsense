@@ -731,12 +731,47 @@ class TestPRContextProcessingIntegration(unittest.TestCase):
         self.assertEqual(result.pull_request.repository, "SurajD45/devsense")
         self.assertIs(result.bridge_result, expected_bridge_result)
 
-        # Key-level access for dictionary compatibility
-        self.assertEqual(result["pull_request_model"], result.pull_request)
-        self.assertEqual(result["bridge_result"], expected_bridge_result)
-        self.assertEqual(result.get("pull_request_model"), result.pull_request)
-        self.assertEqual(result.get("bridge_result"), expected_bridge_result)
-        self.assertEqual(result.raw_context["pull_request"]["number"], 10)
+        # Raw-payload equality and JSON serialization compatibility
+        self.assertEqual(result, self.valid_github_context)
+        self.assertEqual(result.raw_context, self.valid_github_context)
+        self.assertEqual(result["pull_request"]["number"], 10)
+        self.assertEqual(result["pull_request"]["title"], "SCRUM-5 Implement user authentication")
+
+        # Verify JSON serialization succeeds without TypeError and matches raw context
+        serialized = json.dumps(result)
+        expected_json = json.dumps(self.valid_github_context)
+        self.assertEqual(serialized, expected_json)
+        self.assertEqual(json.dumps(result.raw_context), expected_json)
+
+        # Verify domain models are NOT present as dictionary keys
+        self.assertNotIn("pull_request_model", result)
+        self.assertNotIn("bridge_result", result)
+
+    @patch("app.main.get_installation_client")
+    def test_jira_configuration_missing_with_no_jira_key(self, mock_get_github_client):
+        """Fix 2: When Jira config is missing and PR has no Jira key, no error is raised."""
+        no_key_context = dict(self.valid_github_context)
+        no_key_context["pull_request"] = dict(self.valid_github_context["pull_request"])
+        no_key_context["pull_request"]["title"] = "chore: update dependencies and clean code"
+        no_key_context["pull_request"]["body"] = "Routine maintenance with no ticket."
+
+        mock_github = MagicMock()
+        mock_github.get_pull_request_context.return_value = no_key_context
+        mock_get_github_client.return_value = mock_github
+
+        # With JIRA_BASE_URL="", JiraClient() would raise JiraConfigurationError if called.
+        with patch("app.main.JIRA_BASE_URL", ""):
+            result = process_pull_request_context(self.pr_info)
+
+        self.assertIsNotNone(result)
+        self.assertIsInstance(result.pull_request, PullRequest)
+        self.assertIsNotNone(result.bridge_result)
+        self.assertFalse(result.bridge_result.has_requirement)
+        self.assertIsNone(result.bridge_result.jira_key)
+        self.assertEqual(result.bridge_result.reason, "No Jira key found in PR title or body.")
+        # Raw dictionary equality and JSON serialization work
+        self.assertEqual(result, no_key_context)
+        self.assertEqual(json.dumps(result), json.dumps(no_key_context))
 
 
 if __name__ == "__main__":
