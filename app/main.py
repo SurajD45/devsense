@@ -20,6 +20,9 @@ import sys
 
 from fastapi import BackgroundTasks, FastAPI, Request, Response, status
 
+from pydantic import ValidationError
+
+from app.domain.models import PullRequest
 from app.integrations.github.client import (
     GitHubAuthenticationError,
     GitHubClientError,
@@ -27,13 +30,24 @@ from app.integrations.github.client import (
     GitHubNotFoundError,
     GitHubPermissionError,
 )
+from app.integrations.github.mapper import GitHubPullRequestMapper
 from app.integrations.github.service import get_installation_client
 from app.integrations.github.webhook import (
     HANDLED_PR_ACTIONS,
     extract_pr_info,
     verify_signature,
 )
-from app.settings import GITHUB_WEBHOOK_SECRET
+from app.integrations.jira.bridge import BridgeResult, GitHubJiraBridge
+from app.integrations.jira.client import (
+    JiraAuthenticationError,
+    JiraClient,
+    JiraClientError,
+    JiraConfigurationError,
+    JiraIssueNotFoundError,
+    JiraNetworkError,
+)
+from app.integrations.jira.mapper import JiraRequirementMapper
+from app.settings import GITHUB_WEBHOOK_SECRET, JIRA_BASE_URL
 
 # ---------------------------------------------------------------------------
 # Bootstrap
@@ -72,25 +86,83 @@ async def health_check():
     return {"status": "ok"}
 
 
-def process_pull_request_context(pr_info: dict) -> dict | None:
+def get_jira_bridge() -> GitHubJiraBridge:
     """
-    Retrieve and aggregate PR context asynchronously in a background task.
+    Construct a configured GitHubJiraBridge instance.
+
+    Uses application settings (JIRA_BASE_URL, JIRA_EMAIL, JIRA_API_TOKEN).
+    """
+    client = JiraClient()
+    mapper = JiraRequirementMapper()
+    return GitHubJiraBridge(
+        jira_client=client,
+        mapper=mapper,
+        jira_base_url=JIRA_BASE_URL,
+    )
+
+
+class ProcessedPRContext(dict):
+    """
+    Result of PR context retrieval, mapping, and Jira requirement resolution.
+
+    Inherits from dict for backward compatibility with callers and tests expecting
+    the raw GitHub context dictionary, while exposing the mapped PullRequest and
+    BridgeResult models via attributes and dictionary keys.
+    """
+
+    def __init__(
+        self,
+        raw_context: dict,
+        pull_request: PullRequest | None = None,
+        bridge_result: BridgeResult | None = None,
+    ) -> None:
+        super().__init__(raw_context)
+        self.pull_request = pull_request
+        self.bridge_result = bridge_result
+        if pull_request is not None:
+            self["pull_request_model"] = pull_request
+        if bridge_result is not None:
+            self["bridge_result"] = bridge_result
+
+    @property
+    def raw_context(self) -> dict:
+        """Returns the original raw GitHub context without DevSense additions."""
+        return {
+            k: v
+            for k, v in self.items()
+            if k not in ("pull_request_model", "bridge_result")
+        }
+
+
+
+def process_pull_request_context(
+    pr_info: dict,
+    mapper: GitHubPullRequestMapper | None = None,
+    bridge: GitHubJiraBridge | None = None,
+) -> ProcessedPRContext | dict | None:
+    """
+    Retrieve and process PR context asynchronously in a background task.
 
     1. Obtains authenticated GitHubClient via get_installation_client(installation_id).
-    2. Retrieves PR context (metadata, changed files with patches, commits).
-    3. Safely logs summary of evidence retrieved.
-    4. Returns aggregated context for the future investigation pipeline.
+    2. Retrieves raw PR context (metadata, changed files with patches, commits).
+    3. Maps raw context to canonical PullRequest domain model via GitHubPullRequestMapper.
+    4. Resolves linked Jira Requirement via GitHubJiraBridge using PR title and description.
+    5. Returns ProcessedPRContext bundling raw context, PullRequest, and BridgeResult.
 
     Security & Reliability:
-      - Traps all authentication, API, network, and unexpected errors without crashing.
-      - Never logs tokens, JWTs, keys, patches, or full bodies.
+      - Traps all authentication, API, network, validation, and unexpected errors without crashing.
+      - Never logs tokens, JWTs, keys, patches, or credentials.
+      - Gracefully handles PRs with no Jira key or unavailable Jira API.
 
     Args:
         pr_info: Dictionary containing validated PR identifiers:
                  'installation_id', 'owner', 'repo', 'pull_number'.
+        mapper: Optional GitHubPullRequestMapper override (defaults to new instance).
+        bridge: Optional GitHubJiraBridge override (defaults to get_jira_bridge()).
 
     Returns:
-        Aggregated context dictionary, or None if retrieval failed.
+        ProcessedPRContext dictionary containing mapped models and raw data,
+        or None if retrieval failed.
     """
     installation_id = pr_info.get("installation_id")
     owner = pr_info.get("owner")
@@ -113,7 +185,110 @@ def process_pull_request_context(pr_info: dict) -> dict | None:
             files_count,
             commits_count,
         )
-        return context
+
+        # Step 2: Convert raw context to canonical PullRequest domain model
+        pull_request: PullRequest | None = None
+        try:
+            pr_mapper = mapper or GitHubPullRequestMapper()
+            pull_request = pr_mapper.to_pull_request(context, owner, repo)
+            logger.info(
+                "Successfully mapped %s/%s PR #%d to canonical PullRequest domain model: '%s' (%s -> %s) by %s",
+                owner,
+                repo,
+                pull_number,
+                pull_request.title,
+                pull_request.source_branch,
+                pull_request.target_branch,
+                pull_request.author,
+            )
+        except (ValueError, ValidationError) as exc:
+            logger.warning(
+                "Could not map context for %s/%s PR #%d into canonical PullRequest: %s",
+                owner,
+                repo,
+                pull_number,
+                exc,
+            )
+
+        # Step 3: Resolve Jira requirement via GitHubJiraBridge
+        bridge_result: BridgeResult | None = None
+        if pull_request is not None:
+            try:
+                jira_bridge = bridge or get_jira_bridge()
+                bridge_result = jira_bridge.get_requirement_for_pr(
+                    pr_title=pull_request.title,
+                    pr_body=pull_request.description,
+                )
+                if bridge_result.has_requirement:
+                    logger.info(
+                        "Jira requirement resolved for %s/%s PR #%d: requirement_id=%s",
+                        owner,
+                        repo,
+                        pull_number,
+                        bridge_result.requirement.requirement_id,
+                    )
+                else:
+                    logger.info(
+                        "No Jira requirement resolved for %s/%s PR #%d: %s",
+                        owner,
+                        repo,
+                        pull_number,
+                        bridge_result.reason,
+                    )
+            except JiraAuthenticationError:
+                logger.error(
+                    "Jira authentication failed while resolving requirement for %s/%s PR #%d",
+                    owner,
+                    repo,
+                    pull_number,
+                )
+            except JiraIssueNotFoundError as exc:
+                logger.warning(
+                    "Jira issue not found for %s/%s PR #%d: %s",
+                    owner,
+                    repo,
+                    pull_number,
+                    exc,
+                )
+            except JiraNetworkError as exc:
+                logger.error(
+                    "Network error communicating with Jira API for %s/%s PR #%d: %s",
+                    owner,
+                    repo,
+                    pull_number,
+                    exc,
+                )
+            except JiraConfigurationError as exc:
+                logger.warning(
+                    "Jira configuration unavailable while resolving requirement for %s/%s PR #%d: %s",
+                    owner,
+                    repo,
+                    pull_number,
+                    exc,
+                )
+            except JiraClientError as exc:
+                logger.error(
+                    "Jira API error for %s/%s PR #%d: %s",
+                    owner,
+                    repo,
+                    pull_number,
+                    exc,
+                )
+            except Exception as exc:
+                logger.error(
+                    "Unexpected error while resolving Jira requirement for %s/%s PR #%d: %s",
+                    owner,
+                    repo,
+                    pull_number,
+                    type(exc).__name__,
+                )
+
+        # Step 4: Make resulting PullRequest and BridgeResult available to next stage
+        return ProcessedPRContext(
+            raw_context=context,
+            pull_request=pull_request,
+            bridge_result=bridge_result,
+        )
 
     except GitHubAuthenticationError:
         logger.error(

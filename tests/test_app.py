@@ -27,8 +27,17 @@ from app.integrations.github.client import (
     GitHubNetworkError,
     GitHubAPIError,
 )
+from app.domain.models import AcceptanceCriterion, PullRequest, Requirement
 from app.integrations.github.webhook import extract_pr_info, verify_signature
-from app.main import app, github_webhook, health_check, process_pull_request_context
+from app.integrations.jira.bridge import BridgeResult
+from app.integrations.jira.client import JiraAuthenticationError, JiraNetworkError
+from app.main import (
+    ProcessedPRContext,
+    app,
+    github_webhook,
+    health_check,
+    process_pull_request_context,
+)
 from app.settings import GITHUB_WEBHOOK_SECRET
 
 
@@ -509,6 +518,225 @@ class TestEndToEndWebhookFlow(unittest.TestCase):
         # Verify TestClient executed background task and called client methods
         mock_get_client.assert_called_once_with(555666)
         mock_github_client.get_pull_request_context.assert_called_once_with("test-org", "test-repo", 7)
+
+
+class TestPRContextProcessingIntegration(unittest.TestCase):
+    """
+    Focused test suite for PR mapping and GitHub-Jira requirement bridge integration
+    inside process_pull_request_context().
+    """
+
+    def setUp(self):
+        self.pr_info = {
+            "installation_id": 123456,
+            "owner": "SurajD45",
+            "repo": "devsense",
+            "pull_number": 10,
+        }
+        self.valid_github_context = {
+            "pull_request": {
+                "number": 10,
+                "title": "SCRUM-5 Implement user authentication",
+                "body": "Fixes SCRUM-5 by implementing JWT authentication.",
+                "author": "suraj",
+                "head_branch": "feature/auth",
+                "base_branch": "main",
+                "state": "open",
+            },
+            "files": [
+                {
+                    "filename": "app/auth.py",
+                    "status": "added",
+                    "additions": 42,
+                    "deletions": 0,
+                    "changes": 42,
+                    "patch": "@@ -0,0 +1,42 @@",
+                }
+            ],
+            "commits": [
+                {
+                    "sha": "a1b2c3d4e5f6",
+                    "message": "feat: add user authentication",
+                    "author": "suraj",
+                }
+            ],
+        }
+
+    @patch("app.main.get_jira_bridge")
+    @patch("app.main.get_installation_client")
+    def test_successful_pr_mapping_and_jira_resolution(
+        self, mock_get_github_client, mock_get_jira_bridge
+    ):
+        """1. Successful PR mapping and Jira requirement resolution."""
+        mock_github = MagicMock()
+        mock_github.get_pull_request_context.return_value = self.valid_github_context
+        mock_get_github_client.return_value = mock_github
+
+        mock_requirement = Requirement(
+            requirement_id="SCRUM-5",
+            title="Implement user authentication",
+            description="Users must authenticate via JWT",
+            source="https://jira.example.com/browse/SCRUM-5",
+            status="In Progress",
+            acceptance_criteria=[
+                AcceptanceCriterion(
+                    criterion_id="AC-1",
+                    title="User can log in with valid credentials",
+                )
+            ],
+        )
+        mock_bridge = MagicMock()
+        mock_bridge.get_requirement_for_pr.return_value = BridgeResult(
+            requirement=mock_requirement,
+            jira_key="SCRUM-5",
+            reason="Requirement mapped from Jira issue SCRUM-5.",
+        )
+        mock_get_jira_bridge.return_value = mock_bridge
+
+        result = process_pull_request_context(self.pr_info)
+
+        self.assertIsNotNone(result)
+        # Verify PullRequest domain model mapping
+        self.assertIsInstance(result.pull_request, PullRequest)
+        self.assertEqual(result.pull_request.repository, "SurajD45/devsense")
+        self.assertEqual(result.pull_request.number, 10)
+        self.assertEqual(result.pull_request.title, "SCRUM-5 Implement user authentication")
+        self.assertEqual(result.pull_request.author, "suraj")
+        self.assertEqual(result.pull_request.source_branch, "feature/auth")
+        self.assertEqual(result.pull_request.target_branch, "main")
+        self.assertEqual(result.pull_request.state, "open")
+        self.assertEqual(len(result.pull_request.changed_files), 1)
+        self.assertEqual(result.pull_request.changed_files[0].path, "app/auth.py")
+        self.assertEqual(len(result.pull_request.commits), 1)
+        self.assertEqual(result.pull_request.commits[0].sha, "a1b2c3d4e5f6")
+
+        # Verify Jira bridge result
+        self.assertIsNotNone(result.bridge_result)
+        self.assertTrue(result.bridge_result.has_requirement)
+        self.assertEqual(result.bridge_result.jira_key, "SCRUM-5")
+        self.assertEqual(result.bridge_result.requirement.requirement_id, "SCRUM-5")
+        self.assertEqual(len(result.bridge_result.requirement.acceptance_criteria), 1)
+        self.assertEqual(
+            result.bridge_result.requirement.acceptance_criteria[0].criterion_id, "AC-1"
+        )
+        mock_bridge.get_requirement_for_pr.assert_called_once_with(
+            pr_title="SCRUM-5 Implement user authentication",
+            pr_body="Fixes SCRUM-5 by implementing JWT authentication.",
+        )
+
+    @patch("app.main.get_jira_bridge")
+    @patch("app.main.get_installation_client")
+    def test_pr_without_jira_key(self, mock_get_github_client, mock_get_jira_bridge):
+        """2. A PR without a Jira key."""
+        no_key_context = dict(self.valid_github_context)
+        no_key_context["pull_request"] = dict(self.valid_github_context["pull_request"])
+        no_key_context["pull_request"]["title"] = "Refactor logging utilities"
+        no_key_context["pull_request"]["body"] = "Small cleanup with no Jira reference."
+
+        mock_github = MagicMock()
+        mock_github.get_pull_request_context.return_value = no_key_context
+        mock_get_github_client.return_value = mock_github
+
+        mock_bridge = MagicMock()
+        mock_bridge.get_requirement_for_pr.return_value = BridgeResult(
+            requirement=None,
+            jira_key=None,
+            reason="No Jira key found in PR title or body.",
+        )
+        mock_get_jira_bridge.return_value = mock_bridge
+
+        result = process_pull_request_context(self.pr_info)
+
+        self.assertIsNotNone(result)
+        self.assertIsInstance(result.pull_request, PullRequest)
+        self.assertEqual(result.pull_request.number, 10)
+        self.assertIsNotNone(result.bridge_result)
+        self.assertFalse(result.bridge_result.has_requirement)
+        self.assertIsNone(result.bridge_result.requirement)
+        self.assertIsNone(result.bridge_result.jira_key)
+        self.assertIn("No Jira key found", result.bridge_result.reason)
+
+    @patch("app.main.get_jira_bridge")
+    @patch("app.main.get_installation_client")
+    def test_jira_api_network_failure(self, mock_get_github_client, mock_get_jira_bridge):
+        """3. Jira API/network failure must not crash background processing."""
+        mock_github = MagicMock()
+        mock_github.get_pull_request_context.return_value = self.valid_github_context
+        mock_get_github_client.return_value = mock_github
+
+        mock_bridge = MagicMock()
+        mock_bridge.get_requirement_for_pr.side_effect = JiraNetworkError("Jira host unreachable")
+        mock_get_jira_bridge.return_value = mock_bridge
+
+        # Must not raise / crash
+        result = process_pull_request_context(self.pr_info)
+
+        self.assertIsNotNone(result)
+        self.assertIsInstance(result.pull_request, PullRequest)
+        self.assertEqual(result.pull_request.number, 10)
+        # Bridge failed, so bridge_result is None
+        self.assertIsNone(result.bridge_result)
+
+    @patch("app.main.get_jira_bridge")
+    @patch("app.main.get_installation_client")
+    def test_jira_authentication_failure(self, mock_get_github_client, mock_get_jira_bridge):
+        """Jira authentication failure must not crash background processing."""
+        mock_github = MagicMock()
+        mock_github.get_pull_request_context.return_value = self.valid_github_context
+        mock_get_github_client.return_value = mock_github
+
+        mock_bridge = MagicMock()
+        mock_bridge.get_requirement_for_pr.side_effect = JiraAuthenticationError("401 Unauthorized")
+        mock_get_jira_bridge.return_value = mock_bridge
+
+        result = process_pull_request_context(self.pr_info)
+
+        self.assertIsNotNone(result)
+        self.assertIsInstance(result.pull_request, PullRequest)
+        self.assertIsNone(result.bridge_result)
+
+    @patch("app.main.get_jira_bridge")
+    @patch("app.main.get_installation_client")
+    def test_correct_handling_of_mapped_pr_and_bridge_result(
+        self, mock_get_github_client, mock_get_jira_bridge
+    ):
+        """4. Correct handling of the mapped PR and bridge result."""
+        mock_github = MagicMock()
+        mock_github.get_pull_request_context.return_value = self.valid_github_context
+        mock_get_github_client.return_value = mock_github
+
+        mock_requirement = Requirement(
+            requirement_id="SCRUM-5",
+            title="Implement user authentication",
+            source="https://jira.example.com/browse/SCRUM-5",
+            status="In Progress",
+            acceptance_criteria=[
+                AcceptanceCriterion(criterion_id="AC-1", title="AC 1")
+            ],
+        )
+        expected_bridge_result = BridgeResult(
+            requirement=mock_requirement,
+            jira_key="SCRUM-5",
+            reason="Requirement mapped from Jira issue SCRUM-5.",
+        )
+        mock_bridge = MagicMock()
+        mock_bridge.get_requirement_for_pr.return_value = expected_bridge_result
+        mock_get_jira_bridge.return_value = mock_bridge
+
+        result = process_pull_request_context(self.pr_info)
+
+        # Attribute-level access for downstream orchestration
+        self.assertIsInstance(result, ProcessedPRContext)
+        self.assertIs(result.pull_request, result.pull_request)
+        self.assertEqual(result.pull_request.repository, "SurajD45/devsense")
+        self.assertIs(result.bridge_result, expected_bridge_result)
+
+        # Key-level access for dictionary compatibility
+        self.assertEqual(result["pull_request_model"], result.pull_request)
+        self.assertEqual(result["bridge_result"], expected_bridge_result)
+        self.assertEqual(result.get("pull_request_model"), result.pull_request)
+        self.assertEqual(result.get("bridge_result"), expected_bridge_result)
+        self.assertEqual(result.raw_context["pull_request"]["number"], 10)
 
 
 if __name__ == "__main__":
