@@ -6,6 +6,7 @@ Provides authenticated GitHub API access, webhook handling, and PR context retri
 Public API:
     - get_installation_client: Factory for authenticated GitHubClient instances.
     - GitHubClient: Low-level REST API client.
+    - GitHubPullRequestMapper: Transform PR context into validated domain models.
     - GitHubClientError, GitHubAPIError, GitHubNotFoundError, ...: Client exceptions.
 """
 
@@ -19,6 +20,7 @@ from app.integrations.github.client import (
     GitHubNotFoundError,
     GitHubPermissionError,
 )
+from app.integrations.github.mapper import GitHubPullRequestMapper
 from app.integrations.github.service import get_installation_client
 
 __all__ = [
@@ -30,5 +32,6 @@ __all__ = [
     "GitHubAuthenticationError",
     "GitHubPermissionError",
     "GitHubNetworkError",
+    "GitHubPullRequestMapper",
     "get_installation_client",
 ]
