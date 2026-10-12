@@ -1,8 +1,8 @@
 # DevSense — Investigation Pipeline Schemas Technical Documentation
 
-**Author / Owner:** Member 3  
-**Branch:** `feature/investigation-pipeline-schemas`  
-**Target Module:** `app.investigation`  
+**Author / Owner:** Member 3
+**Branch:** `feature/investigation-pipeline-schemas`
+**Target Module:** `app.investigation`
 **Primary Files:**
 - `app/investigation/schemas.py`
 - `app/investigation/__init__.py`
@@ -37,21 +37,21 @@ This establishes the immutable boundaries for a future pipeline orchestrator wit
 
 ## 2. Why Typed Input/Output Contracts Are Needed
 
-1. **Decoupling Integrations from Investigation:**  
+1. **Decoupling Integrations from Investigation:**
    GitHub webhooks (`app.main`) and Jira bridges (`app.integrations.jira.bridge`) fetch external data and convert them into canonical domain models (`PullRequest`, `Requirement`). Typed pipeline schemas guarantee that the investigation pipeline never relies on raw API payloads, GitHub tokens, or ad-hoc dictionaries.
-2. **Deterministic Orchestration:**  
+2. **Deterministic Orchestration:**
    The future pipeline orchestrator can treat the investigation engine as a pure, deterministic function:
    $$\text{Orchestrator}(\text{InvestigationPipelineInput}) \longrightarrow \text{InvestigationResultBundle}$$
-3. **Data Integrity & Traceability:**  
+3. **Data Integrity & Traceability:**
    In automated code review, citing nonexistent line numbers or inventing fictitious evidence breaks developer trust. Pydantic-enforced referential integrity ensures that every cited evidence identifier (`EV-<digits>`) in a finding actually resolves to a concrete evidence object in the bundle.
-4. **State Isolation & Reentrancy:**  
+4. **State Isolation & Reentrancy:**
    Using typed contracts with isolated defaults (`default_factory`) guarantees that multiple investigations running in parallel or sequentially cannot contaminate each other's data structures.
 
 ---
 
 ## 3. `InvestigationPipelineInput` Specification
 
-Defined in [`app/investigation/schemas.py`](file:///c:/Users/richa/Downloads/all_downloads/btech/edi_t3/devsense/app/investigation/schemas.py).
+Defined in [`app/investigation/schemas.py`](../app/investigation/schemas.py).
 
 ### Model Schema
 ```python
@@ -87,7 +87,7 @@ class InvestigationPipelineInput(BaseModel):
 
 ## 4. `InvestigationResultBundle` Specification
 
-Defined in [`app/investigation/schemas.py`](file:///c:/Users/richa/Downloads/all_downloads/btech/edi_t3/devsense/app/investigation/schemas.py).
+Defined in [`app/investigation/schemas.py`](../app/investigation/schemas.py).
 
 ### Model Schema
 ```python
@@ -186,11 +186,11 @@ graph TD
 ```
 
 ### Reused Domain Entities
-- **[`PullRequest`](file:///c:/Users/richa/Downloads/all_downloads/btech/edi_t3/devsense/app/domain/models.py#L113):** Supplies repository coordinates, commit history, and changed files with diff additions/deletions.
-- **[`Requirement`](file:///c:/Users/richa/Downloads/all_downloads/btech/edi_t3/devsense/app/domain/models.py#L296):** Supplies provider-independent acceptance criteria (`AcceptanceCriterion`).
-- **[`Investigation`](file:///c:/Users/richa/Downloads/all_downloads/btech/edi_t3/devsense/app/domain/models.py#L578):** Orchestration-level anchor tying together PR number, requirement ID, and finding IDs.
-- **[`Finding`](file:///c:/Users/richa/Downloads/all_downloads/btech/edi_t3/devsense/app/domain/models.py#L488):** Criterion verification judgments (`VERIFIED`, `PARTIALLY_VERIFIED`, `NOT_VERIFIED`, `REQUIRES_REVIEW`).
-- **[`Evidence`](file:///c:/Users/richa/Downloads/all_downloads/btech/edi_t3/devsense/app/domain/models.py#L380):** Lightweight pointers to concrete files, line ranges, commit SHAs, and symbols.
+- **[`PullRequest`](../app/domain/models.py#L113):** Supplies repository coordinates, commit history, and changed files with diff additions/deletions.
+- **[`Requirement`](../app/domain/models.py#L296):** Supplies provider-independent acceptance criteria (`AcceptanceCriterion`).
+- **[`Investigation`](../app/domain/models.py#L578):** Orchestration-level anchor tying together PR number, requirement ID, and finding IDs.
+- **[`Finding`](../app/domain/models.py#L488):** Criterion verification judgments (`VERIFIED`, `PARTIALLY_VERIFIED`, `NOT_VERIFIED`, `REQUIRES_REVIEW`).
+- **[`Evidence`](../app/domain/models.py#L380):** Lightweight pointers to concrete files, line ranges, commit SHAs, and symbols.
 
 ### Reused Pipeline DTOs
 - **`RequirementAnalysis`:** Operational breakdown of criteria into verification points.
@@ -220,23 +220,23 @@ graph TD
 
 ## 7. Package Exports: `app/investigation/__init__.py`
 
-[`app/investigation/__init__.py`](file:///c:/Users/richa/Downloads/all_downloads/btech/edi_t3/devsense/app/investigation/__init__.py) acts as the public API surface for the investigation package.
+[`app/investigation/__init__.py`](../app/investigation/__init__.py) acts as the public API surface for the investigation package.
 
 ### Why Exports Are Required
-1. **Public Contract Visibility:**  
+1. **Public Contract Visibility:**
    Downstream orchestrators and services import contracts cleanly via:
    ```python
    from app.investigation import InvestigationPipelineInput, InvestigationResultBundle
    ```
    without needing to know internal module file paths (`app.investigation.schemas`).
-2. **Packaging Standards:**  
+2. **Packaging Standards:**
    Exposing classes through both module-level imports and `__all__` supports static analysis tools, IDE auto-completion, and wildcard imports while preventing namespace pollution.
 
 ---
 
 ## 8. Unit Tests & Actual Verified Results
 
-Test suite: [`tests/test_investigation_pipeline_schemas.py`](file:///c:/Users/richa/Downloads/all_downloads/btech/edi_t3/devsense/tests/test_investigation_pipeline_schemas.py) (28 test cases).
+Test suite: [`tests/test_investigation_pipeline_schemas.py`](../tests/test_investigation_pipeline_schemas.py) (28 test cases).
 
 ### Summary of Test Cases
 - **`TestInvestigationPipelineInput` (10 tests):**
@@ -274,10 +274,10 @@ Test suite: [`tests/test_investigation_pipeline_schemas.py`](file:///c:/Users/ri
 ### Verified Test Run Results
 ```powershell
 python -m pytest tests/test_investigation_pipeline_schemas.py -q
-# Result: 28 passed in 0.91s
+# Result: 28 passed in 0.69s
 
-python -m pytest tests/domain tests/investigation -q
-# Result: 371 passed, 35 subtests passed in 1.49s
+python -m pytest -q
+# Result: 668 passed, 2 warnings in 2.99s (post-merge with main)
 
 git diff --check
 # Result: Clean (exit code 0)
@@ -301,22 +301,22 @@ sequenceDiagram
 
     Caller->>Pipeline: execute(InvestigationPipelineInput)
     Note over Pipeline: Validates PR, Requirement (criteria >= 1), file_contents
-    
+
     Pipeline->>S1: analyze(Requirement)
     S1-->>Pipeline: RequirementAnalysis
-    
+
     Pipeline->>S2: analyze(RequirementAnalysis, changed_files)
     S2-->>Pipeline: ChangeImpactAnalysis
-    
+
     Pipeline->>S3: promote(ChangeImpactAnalysis, changed_files)
     S3-->>Pipeline: FilePromotionAnalysis
-    
+
     Pipeline->>S4: investigate(files, file_contents)
     S4-->>Pipeline: list[CodeInvestigationResult]
-    
+
     Pipeline->>S5: build(observations)
     S5-->>Pipeline: CodeEvidenceBuildResult
-    
+
     Note over Pipeline: Generate Findings & assemble Investigation record
     Pipeline->>Bundle: Construct InvestigationResultBundle
     Note over Bundle: Enforces referential integrity, sequence, status consistency
@@ -341,12 +341,12 @@ To prevent scope creep, Member 3's task explicitly does **not** implement:
 During full-suite execution (`python -m pytest -q`), pytest terminates during discovery with an `INTERNALERROR`.
 
 ### Root Cause
-1. Pytest collects all test files in `tests/`, including [`tests/test_app.py`](file:///c:/Users/richa/Downloads/all_downloads/btech/edi_t3/devsense/tests/test_app.py).
+1. Pytest collects all test files in `tests/`, including [`tests/test_app.py`](../tests/test_app.py).
 2. Line 31 of `tests/test_app.py` imports `app.main`:
    ```python
    from app.main import app, github_webhook, health_check, process_pull_request_context
    ```
-3. Lines 54–56 of [`app/main.py`](file:///c:/Users/richa/Downloads/all_downloads/btech/edi_t3/devsense/app/main.py#L54-L56) execute at module-import time:
+3. Lines 54–56 of [`app/main.py`](../app/main.py#L54-L56) execute at module-import time:
    ```python
    if not GITHUB_WEBHOOK_SECRET:
        logger.error("GITHUB_WEBHOOK_SECRET is not set. Exiting.")
@@ -377,9 +377,9 @@ During full-suite execution (`python -m pytest -q`), pytest terminates during di
 - [x] Zero application changes to webhook, integration, or agent modules.
 
 ### Suggested Team-Lead Summary
-> **DevSense Member 3 — Task Completion Summary:**  
-> - **Delivered:** Defined and validated the typed contracts for the investigation pipeline (`InvestigationPipelineInput` and `InvestigationResultBundle`) in `app/investigation/schemas.py`, exported them via `app/investigation/__init__.py`, and implemented a 28-test unit suite in `tests/test_investigation_pipeline_schemas.py`.  
-> - **Integrity:** Enforced strict referential integrity between findings and evidence, positional finding ID alignment, safe collection defaults, and status-aware failure behaviors without mutating caller data.  
-> - **Verification:** 28/28 focused tests pass; 371/371 domain and investigation tests pass cleanly. `git diff --check` reported zero formatting errors.  
-> - **Upstream Finding:** Full-suite `pytest -q` collection crash was traced to `app/main.py:56` exiting when `GITHUB_WEBHOOK_SECRET` is unset; verified completely independent of investigation schemas.  
+> **DevSense Member 3 — Task Completion Summary:**
+> - **Delivered:** Defined and validated the typed contracts for the investigation pipeline (`InvestigationPipelineInput` and `InvestigationResultBundle`) in `app/investigation/schemas.py`, exported them via `app/investigation/__init__.py`, and implemented a 28-test unit suite in `tests/test_investigation_pipeline_schemas.py`.
+> - **Integrity:** Enforced strict referential integrity between findings and evidence, positional finding ID alignment, safe collection defaults, and status-aware failure behaviors without mutating caller data.
+> - **Verification:** 28/28 focused tests pass; 668/668 full test suite pass cleanly post-merge with main. `git diff --check` verified clean with zero formatting errors.
+> - **Upstream Finding:** Full-suite `pytest -q` collection crash was traced to `app/main.py:56` exiting when `GITHUB_WEBHOOK_SECRET` is unset; verified completely independent of investigation schemas.
 > - **Documentation:** Technical documentation saved to `docs/investigation-pipeline-schemas.md`. Branch is ready for review and merge.
