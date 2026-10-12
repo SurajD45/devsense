@@ -36,6 +36,9 @@ from app.investigation.schemas import (
     FileReviewPriority,
     RequirementAnalysis,
     RequirementAwareCodeInvestigationInput,
+    TestEvidenceBuildResult,
+    TestExecutionRecord,
+    TestExecutionStatus,
 )
 
 
@@ -1284,6 +1287,152 @@ class CodeEvidenceBuilder:
 
 
 EvidenceBuilder = CodeEvidenceBuilder
+
+
+# ---------------------------------------------------------------------------
+# TestEvidenceBuilder
+# ---------------------------------------------------------------------------
+
+class TestEvidenceBuilder:
+    """
+    Builds domain Evidence objects from TestExecutionRecords.
+
+    Converts concrete test execution telemetry into Evidence domain objects
+    using EvidenceType.TEST, suitable for downstream requirement verification
+    and audit citations.
+
+    Architectural Invariants:
+    1. Evidence is a reference to an artifact, not stored test code or logs.
+    2. Does NOT store full execution tracebacks, patches, or source files inside Evidence.
+    3. Uses the canonical domain Evidence model (EvidenceType.TEST).
+    4. Does NOT create Findings.
+    5. Does NOT decide whether an acceptance criterion is verified.
+    6. Does NOT infer test execution from the mere presence of test files.
+    7. Pure deterministic logic (no LLM, no subprocess runner, no DB).
+    8. Preserves 1-to-1 traceability via TestEvidenceBuildResult (test_id -> evidence_id).
+    """
+
+    def build(
+        self,
+        records: list[TestExecutionRecord],
+        repository: str | None = None,
+        commit_sha: str | None = None,
+        start_id: int = 1,
+    ) -> TestEvidenceBuildResult:
+        """
+        Convert test execution records into domain Evidence objects.
+
+        Parameters
+        ----------
+        records : list[TestExecutionRecord]
+            List of TestExecutionRecord instances to convert.
+        repository : str | None, optional
+            Repository identifier to associate with the generated Evidence.
+        commit_sha : str | None, optional
+            Default Git commit SHA (e.g. PR head commit) to associate with Evidence
+            when a record does not specify its own commit_sha.
+        start_id : int, optional
+            Starting sequence number for deterministic Evidence IDs (default 1 -> EV-1).
+
+        Returns
+        -------
+        TestEvidenceBuildResult
+            Result containing the list of Evidence objects, original test records,
+            and the test_id -> evidence_id mapping for complete traceability.
+
+        Raises
+        ------
+        TypeError
+            If records is not a list, or any item in records is not a TestExecutionRecord.
+        ValueError
+            If start_id < 1 or duplicate test_id values are found in records.
+        """
+        if not isinstance(records, list):
+            raise TypeError(
+                f"records must be a list, got {type(records).__name__}"
+            )
+
+        if start_id < 1:
+            raise ValueError(f"start_id must be >= 1, got {start_id}")
+
+        evidence_list: list[Evidence] = []
+        mapping: dict[str, str] = {}
+        seen_test_ids: set[str] = set()
+
+        for idx, record in enumerate(records):
+            if not isinstance(record, TestExecutionRecord):
+                raise TypeError(
+                    f"All items in records must be TestExecutionRecord instances; "
+                    f"item at index {idx} is {type(record).__name__}"
+                )
+
+            if record.test_id in seen_test_ids:
+                raise ValueError(
+                    f"Duplicate test_id '{record.test_id}' found in records"
+                )
+            seen_test_ids.add(record.test_id)
+
+            ev_id = f"EV-{start_id + idx}"
+
+            # Effective commit SHA: record.commit_sha takes precedence over fallback commit_sha
+            effective_commit_sha = (
+                record.commit_sha if record.commit_sha is not None else commit_sha
+            )
+
+            # Format descriptive execution outcome
+            description = self._format_description(record)
+
+            evidence = Evidence(
+                evidence_id=ev_id,
+                evidence_type=EvidenceType.TEST,
+                repository=repository,
+                file_path=record.file_path,
+                start_line=record.start_line,
+                end_line=record.end_line,
+                symbol=record.test_name,
+                commit_sha=effective_commit_sha,
+                description=description,
+            )
+            evidence_list.append(evidence)
+            mapping[record.test_id] = ev_id
+
+        return TestEvidenceBuildResult(
+            evidence=evidence_list,
+            test_to_evidence=mapping,
+            test_records=records,
+        )
+
+    build_result = build
+
+    def build_evidence(
+        self,
+        records: list[TestExecutionRecord],
+        repository: str | None = None,
+        commit_sha: str | None = None,
+        start_id: int = 1,
+    ) -> list[Evidence]:
+        """
+        Convenience method returning directly the list of Evidence objects.
+        """
+        return self.build(
+            records=records,
+            repository=repository,
+            commit_sha=commit_sha,
+            start_id=start_id,
+        ).evidence
+
+    @staticmethod
+    def _format_description(record: TestExecutionRecord) -> str:
+        """
+        Format a concise, deterministic description of the test execution outcome.
+        """
+        parts = [f"Test '{record.test_name}' {record.status.value}"]
+        if record.duration_ms is not None:
+            parts.append(f"({record.duration_ms}ms)")
+        summary = " ".join(parts)
+        if record.failure_message:
+            return f"{summary}: {record.failure_message}"
+        return summary
 
 
 

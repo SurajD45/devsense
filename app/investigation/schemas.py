@@ -32,6 +32,7 @@ from app.domain.models import (
 _CRITERION_ID_PATTERN = re.compile(r"^AC-[0-9]+$")
 _EVIDENCE_ID_PATTERN = re.compile(r"^EV-[0-9]+$")
 _FINDING_ID_PATTERN = re.compile(r"^FIND-[0-9]+$")
+_HEX_SHA_PATTERN = re.compile(r"^[0-9a-fA-F]{7,40}$")
 _INVESTIGATION_ID_PATTERN = re.compile(r"^INV-[0-9]+$")
 _PATH_SEPARATORS_PATTERN = re.compile(r"[/\\]")
 
@@ -668,6 +669,240 @@ class CodeEvidenceBuildResult(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# TestExecutionStatus
+# ---------------------------------------------------------------------------
+
+class TestExecutionStatus(str, Enum):
+    """
+    Categorizes the execution outcome of an automated test case.
+    """
+
+    PASSED = "PASSED"
+    FAILED = "FAILED"
+    SKIPPED = "SKIPPED"
+    NOT_RUN = "NOT_RUN"
+
+
+TestExecutionStatus.__test__ = False
+
+
+# ---------------------------------------------------------------------------
+# TestExecutionRecord
+# ---------------------------------------------------------------------------
+
+class TestExecutionRecord(BaseModel):
+    """
+    Structured outcome of an individual automated test case execution.
+
+    Represents factual test telemetry (e.g. from CI/CD runners or test frameworks),
+    strictly decoupled from requirement verification judgments.
+    """
+
+    __test__ = False
+
+    test_id: str
+    file_path: str
+    test_name: str
+    status: TestExecutionStatus
+    criterion_ids: list[str] = Field(default_factory=list)
+    duration_ms: float | None = Field(default=None, ge=0.0)
+    failure_message: str | None = None
+    start_line: int | None = Field(default=None, ge=1)
+    end_line: int | None = Field(default=None, ge=1)
+    commit_sha: str | None = None
+
+    @field_validator("test_id")
+    @classmethod
+    def _validate_test_id(cls, value: str) -> str:
+        return _validate_non_empty_str(value, "test_id")
+
+    @field_validator("file_path")
+    @classmethod
+    def _validate_file_path(cls, value: str) -> str:
+        return _validate_non_empty_str(value, "file_path")
+
+    @field_validator("test_name")
+    @classmethod
+    def _validate_test_name(cls, value: str) -> str:
+        return _validate_non_empty_str(value, "test_name")
+
+    @field_validator("criterion_ids")
+    @classmethod
+    def _validate_criterion_ids(cls, values: list[str]) -> list[str]:
+        cleaned_list: list[str] = []
+        seen: set[str] = set()
+        for i, val in enumerate(values):
+            cleaned = _validate_non_empty_str(val, f"criterion_ids[{i}]")
+            if not _CRITERION_ID_PATTERN.fullmatch(cleaned):
+                raise ValueError(
+                    f"criterion_ids[{i}] '{val}' is invalid; "
+                    "must match pattern 'AC-<number>' (e.g. 'AC-1', 'AC-42')"
+                )
+            if cleaned not in seen:
+                seen.add(cleaned)
+                cleaned_list.append(cleaned)
+        return cleaned_list
+
+    @field_validator("duration_ms")
+    @classmethod
+    def _validate_duration_ms(cls, value: float | None) -> float | None:
+        if value is None:
+            return None
+        if not isinstance(value, (int, float)) or value < 0.0:
+            raise ValueError("duration_ms must be a non-negative number")
+        return float(value)
+
+    @field_validator("failure_message")
+    @classmethod
+    def _validate_failure_message(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            raise ValueError("failure_message must be a string or None")
+        cleaned = value.strip()
+        return cleaned if cleaned else None
+
+    @field_validator("commit_sha")
+    @classmethod
+    def _validate_commit_sha(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        cleaned = _validate_non_empty_str(value, "commit_sha")
+        if not _HEX_SHA_PATTERN.fullmatch(cleaned):
+            raise ValueError(
+                f"commit_sha '{value}' is invalid; must be a hexadecimal Git commit SHA (7 to 40 characters)"
+            )
+        return cleaned.lower()
+
+    @model_validator(mode="after")
+    def _validate_line_range(self) -> "TestExecutionRecord":
+        if self.start_line is not None and self.end_line is not None:
+            if self.end_line < self.start_line:
+                raise ValueError(
+                    f"end_line ({self.end_line}) must be >= start_line ({self.start_line})"
+                )
+        return self
+
+
+# ---------------------------------------------------------------------------
+# TestEvidenceBuildResult
+# ---------------------------------------------------------------------------
+
+class TestEvidenceBuildResult(BaseModel):
+    """
+    Structured outcome of building domain Evidence objects from test execution records.
+
+    Preserves 1-to-1 traceability between test records and generated Evidence
+    references without modifying the canonical domain Evidence model.
+    """
+
+    __test__ = False
+
+    evidence: list[Evidence] = Field(default_factory=list)
+    test_to_evidence: dict[str, str] = Field(default_factory=dict)
+    test_records: list[TestExecutionRecord] = Field(default_factory=list)
+
+    @field_validator("evidence")
+    @classmethod
+    def _validate_evidence(cls, values: list[Evidence]) -> list[Evidence]:
+        seen: set[str] = set()
+        for ev in values:
+            if not isinstance(ev, Evidence):
+                raise TypeError(f"Expected Evidence instance, got {type(ev).__name__}")
+            if ev.evidence_id in seen:
+                raise ValueError(
+                    f"Duplicate evidence_id '{ev.evidence_id}' found in evidence list"
+                )
+            seen.add(ev.evidence_id)
+        return values
+
+    @field_validator("test_records")
+    @classmethod
+    def _validate_test_records(
+        cls, values: list[TestExecutionRecord]
+    ) -> list[TestExecutionRecord]:
+        seen: set[str] = set()
+        for tr in values:
+            if not isinstance(tr, TestExecutionRecord):
+                raise TypeError(
+                    f"Expected TestExecutionRecord instance, got {type(tr).__name__}"
+                )
+            if tr.test_id in seen:
+                raise ValueError(
+                    f"Duplicate test_id '{tr.test_id}' found in test_records list"
+                )
+            seen.add(tr.test_id)
+        return values
+
+    @field_validator("test_to_evidence")
+    @classmethod
+    def _validate_mapping(cls, value: dict[str, str]) -> dict[str, str]:
+        for test_id, ev_id in value.items():
+            _validate_non_empty_str(test_id, "test_to_evidence key")
+            if not isinstance(ev_id, str) or not _EVIDENCE_ID_PATTERN.fullmatch(ev_id):
+                raise ValueError(
+                    f"evidence_id value '{ev_id}' is invalid; must match pattern 'EV-<number>'"
+                )
+        return value
+
+    @model_validator(mode="after")
+    def _validate_traceability(self) -> "TestEvidenceBuildResult":
+        record_test_ids = {tr.test_id for tr in self.test_records}
+        evidence_ids = {ev.evidence_id for ev in self.evidence}
+        mapped_test_ids = set(self.test_to_evidence.keys())
+        mapped_ev_ids = set(self.test_to_evidence.values())
+
+        # 1. Traceability mappings must reference existing test records
+        unknown_tests = mapped_test_ids - record_test_ids
+        if unknown_tests:
+            raise ValueError(
+                f"test_to_evidence references unknown test_id(s) not in test_records: {unknown_tests}"
+            )
+
+        # 2. All test records must be mapped in test_to_evidence
+        unmapped_tests = record_test_ids - mapped_test_ids
+        if unmapped_tests:
+            raise ValueError(
+                f"test_records contains test_id(s) missing from test_to_evidence mapping: {unmapped_tests}"
+            )
+
+        # 3. Evidence IDs in evidence list must match mapped evidence IDs
+        if mapped_ev_ids != evidence_ids:
+            raise ValueError(
+                "Evidence IDs in evidence list do not match IDs in test_to_evidence mapping"
+            )
+
+        # 4. Require the number of test records, mapping entries, and evidence objects to agree
+        if len(self.test_records) != len(self.test_to_evidence):
+            raise ValueError(
+                f"Mismatch between number of test records ({len(self.test_records)}) "
+                f"and test mappings ({len(self.test_to_evidence)})"
+            )
+
+        if len(self.evidence) != len(self.test_to_evidence):
+            raise ValueError(
+                f"Mismatch between number of evidence objects ({len(self.evidence)}) "
+                f"and test mappings ({len(self.test_to_evidence)})"
+            )
+
+        return self
+
+    @property
+    def evidence_to_test(self) -> dict[str, str]:
+        """Reverse mapping from evidence_id to test_id."""
+        return {ev_id: test_id for test_id, ev_id in self.test_to_evidence.items()}
+
+    def __iter__(self):
+        return iter(self.evidence)
+
+    def __len__(self) -> int:
+        return len(self.evidence)
+
+    def __getitem__(self, index: int | slice):
+        return self.evidence[index]
+
+
+# ---------------------------------------------------------------------------
 # InvestigationPipelineInput
 # ---------------------------------------------------------------------------
 
@@ -679,12 +914,14 @@ class InvestigationPipelineInput(BaseModel):
     - The normalized pull request to be investigated.
     - The linked specification requirement containing acceptance criteria.
     - An optional in-memory mapping of repository file paths to file contents.
+    - An optional collection of structured test execution records.
     - An optional explicit investigation identifier.
     """
 
     pull_request: PullRequest
     requirement: Requirement
     file_contents: dict[str, str] = Field(default_factory=dict)
+    test_results: list[TestExecutionRecord] = Field(default_factory=list)
     investigation_id: str | None = None
 
     @field_validator("investigation_id")
@@ -724,6 +961,24 @@ class InvestigationPipelineInput(BaseModel):
             )
         return value
 
+    @field_validator("test_results")
+    @classmethod
+    def _validate_test_results(
+        cls, values: list[TestExecutionRecord]
+    ) -> list[TestExecutionRecord]:
+        seen_test_ids: set[str] = set()
+        for idx, tr in enumerate(values):
+            if not isinstance(tr, TestExecutionRecord):
+                raise TypeError(
+                    f"Expected TestExecutionRecord instance, got {type(tr).__name__} at index {idx}"
+                )
+            if tr.test_id in seen_test_ids:
+                raise ValueError(
+                    f"Duplicate test_id '{tr.test_id}' in test_results"
+                )
+            seen_test_ids.add(tr.test_id)
+        return values
+
 
 # ---------------------------------------------------------------------------
 # InvestigationResultBundle
@@ -748,6 +1003,7 @@ class InvestigationResultBundle(BaseModel):
     promotion_analysis: FilePromotionAnalysis | None = None
     code_investigation_results: list[CodeInvestigationResult] = Field(default_factory=list)
     evidence_build_result: CodeEvidenceBuildResult | None = None
+    test_evidence_build_result: TestEvidenceBuildResult | None = None
 
     # Execution / diagnostic errors
     errors: list[str] = Field(default_factory=list)
@@ -848,6 +1104,15 @@ class InvestigationResultBundle(BaseModel):
                 missing = build_result_ev_ids - available_evidence_ids
                 raise ValueError(
                     f"Bundle evidence list is missing evidence IDs from evidence_build_result: {missing}"
+                )
+
+        # 5. Traceability with test_evidence_build_result if provided
+        if self.test_evidence_build_result is not None:
+            test_ev_ids = {ev.evidence_id for ev in self.test_evidence_build_result.evidence}
+            if not test_ev_ids.issubset(available_evidence_ids):
+                missing = test_ev_ids - available_evidence_ids
+                raise ValueError(
+                    f"Bundle evidence list is missing evidence IDs from test_evidence_build_result: {missing}"
                 )
 
         return self
