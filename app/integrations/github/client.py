@@ -13,6 +13,7 @@ import base64
 import binascii
 import logging
 from urllib.parse import quote
+import re
 
 import requests
 
@@ -23,8 +24,11 @@ from app.integrations.github.auth import (
 
 logger = logging.getLogger("github_client")
 
+_HEX_SHA_PATTERN = re.compile(r"^[0-9a-fA-F]{7,40}$")
+
 # Safety cap for pagination to prevent infinite loops (up to 10,000 files)
 DEFAULT_MAX_PAGES = 100
+
 
 
 # ---------------------------------------------------------------------------
@@ -726,6 +730,12 @@ class GitHubClient:
 
         head = data.get("head") or {}
         head_branch = head.get("ref", "")
+        raw_head_sha = head.get("sha")
+        head_sha: str | None = None
+        if isinstance(raw_head_sha, str):
+            cleaned_sha = raw_head_sha.strip()
+            if _HEX_SHA_PATTERN.fullmatch(cleaned_sha):
+                head_sha = cleaned_sha.lower()
 
         raw_body = data.get("body")
         body = "" if raw_body is None else raw_body
@@ -739,6 +749,7 @@ class GitHubClient:
             "html_url": data.get("html_url", ""),
             "base_branch": base_branch,
             "head_branch": head_branch,
+            "head_sha": head_sha,
             "created_at": data.get("created_at", ""),
             "updated_at": data.get("updated_at", ""),
         }

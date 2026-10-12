@@ -13,8 +13,11 @@ Security:
 import hashlib
 import hmac
 import logging
+import re
 
 logger = logging.getLogger("webhook")
+
+_HEX_SHA_PATTERN = re.compile(r"^[0-9a-fA-F]{7,40}$")
 
 
 # ---------------------------------------------------------------------------
@@ -143,6 +146,12 @@ def extract_pr_info(payload: dict) -> dict | None:
 
     head = pr.get("head")
     source_branch = head.get("ref", "unknown") if isinstance(head, dict) else "unknown"
+    raw_head_sha = head.get("sha") if isinstance(head, dict) else None
+    head_commit_sha: str | None = None
+    if isinstance(raw_head_sha, str):
+        cleaned_sha = raw_head_sha.strip()
+        if _HEX_SHA_PATTERN.fullmatch(cleaned_sha):
+            head_commit_sha = cleaned_sha.lower()
 
     base = pr.get("base")
     target_branch = base.get("ref", "unknown") if isinstance(base, dict) else "unknown"
@@ -157,4 +166,5 @@ def extract_pr_info(payload: dict) -> dict | None:
         "pr_author": pr_author,
         "source_branch": source_branch,
         "target_branch": target_branch,
+        "head_commit_sha": head_commit_sha,
     }

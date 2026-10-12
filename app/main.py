@@ -16,6 +16,7 @@ Required environment variables:
 
 import json
 import logging
+import re
 import sys
 
 from fastapi import BackgroundTasks, FastAPI, Request, Response, status
@@ -29,6 +30,10 @@ from app.integrations.github.client import (
     GitHubNetworkError,
     GitHubNotFoundError,
     GitHubPermissionError,
+)
+from app.integrations.github.content import (
+    ChangedFileContentBatch,
+    GitHubFileContentService,
 )
 from app.integrations.github.mapper import GitHubPullRequestMapper
 from app.integrations.github.service import get_installation_client
@@ -102,20 +107,35 @@ def get_jira_bridge() -> GitHubJiraBridge:
     )
 
 
+_HEX_SHA_PATTERN = re.compile(r"^[0-9a-fA-F]{7,40}$")
+
+
+def _clean_sha(value: object) -> str | None:
+    """Validate that value is a 7-40 char hexadecimal SHA string, normalized to lowercase."""
+    if isinstance(value, str):
+        cleaned = value.strip()
+        if _HEX_SHA_PATTERN.fullmatch(cleaned):
+            return cleaned.lower()
+    return None
+
+
 class ProcessedPRContext(dict):
     """
-    Result of PR context retrieval, mapping, and Jira requirement resolution.
+    Result of PR context retrieval, mapping, Jira requirement resolution,
+    and changed-file content retrieval.
 
     Inherits from dict for full backward compatibility with callers and tests expecting
-    the raw GitHub context dictionary, while exposing the mapped PullRequest and
-    BridgeResult models via attributes and the raw_context property.
+    the raw GitHub context dictionary, while exposing the mapped PullRequest,
+    BridgeResult models, head_commit_sha, and file contents via attributes and the
+    raw_context property.
 
     Design Decision:
       The underlying dictionary contains strictly the original raw GitHub context fields,
       preserving raw payload dictionary equality (context == raw_context) and JSON
       serialization compatibility (json.dumps(context)). Mapped domain models (PullRequest,
-      BridgeResult) are exposed explicitly as attributes and properties, preventing domain
-      models from contaminating raw dictionary keys or breaking JSON serializers.
+      BridgeResult) and retrieved file contents are exposed explicitly as attributes and
+      properties, preventing domain models or large file buffers from contaminating raw
+      dictionary keys or breaking JSON serializers.
     """
 
     def __init__(
@@ -123,10 +143,16 @@ class ProcessedPRContext(dict):
         raw_context: dict,
         pull_request: PullRequest | None = None,
         bridge_result: BridgeResult | None = None,
+        head_commit_sha: str | None = None,
+        file_contents: dict[str, str] | None = None,
+        content_batch: ChangedFileContentBatch | None = None,
     ) -> None:
         super().__init__(raw_context)
         self.pull_request = pull_request
         self.bridge_result = bridge_result
+        self.head_commit_sha = head_commit_sha
+        self.file_contents = file_contents if file_contents is not None else {}
+        self.content_batch = content_batch
 
     @property
     def raw_context(self) -> dict:
@@ -139,7 +165,9 @@ def process_pull_request_context(
     pr_info: dict,
     mapper: GitHubPullRequestMapper | None = None,
     bridge: GitHubJiraBridge | None = None,
+    content_service: GitHubFileContentService | None = None,
 ) -> ProcessedPRContext | dict | None:
+
     """
     Retrieve and process PR context asynchronously in a background task.
 
@@ -299,11 +327,102 @@ def process_pull_request_context(
                         type(exc).__name__,
                     )
 
-        # Step 4: Make resulting PullRequest and BridgeResult available to next stage
+        # Step 4: Resolve verified PR head commit SHA from authoritative live GitHub PR metadata
+        # Invariant: Head SHA must come from authoritative live GitHub PR head metadata (atomically consistent
+        # with context["files"]). Webhook payload SHA is NEVER used for content retrieval, guaranteeing snapshot consistency.
+        # We never infer head SHA from commits[-1].sha, branch names, base branch, or webhook fallback.
+        live_api_sha = (
+            _clean_sha(pull_request.head_sha if pull_request else None)
+            or _clean_sha(context.get("pull_request", {}).get("head_sha"))
+            or _clean_sha(
+                context.get("pull_request", {}).get("head", {}).get("sha")
+                if isinstance(context.get("pull_request", {}).get("head"), dict)
+                else None
+            )
+        )
+        webhook_sha = _clean_sha(pr_info.get("head_commit_sha"))
+
+        verified_head_sha: str | None = None
+        if live_api_sha:
+            verified_head_sha = live_api_sha
+            if webhook_sha and webhook_sha != live_api_sha:
+                logger.warning(
+                    "PR head discrepancy for %s/%s PR #%d: webhook head SHA (%s) differs from live GitHub head SHA (%s); selected live GitHub head.",
+                    owner,
+                    repo,
+                    pull_number,
+                    webhook_sha[:7],
+                    live_api_sha[:7],
+                )
+
+        if pull_request is not None and pull_request.head_sha is None and verified_head_sha:
+            pull_request.head_sha = verified_head_sha
+
+        # Step 5: Retrieve changed-file contents pinned to the exact verified head commit SHA
+        file_contents: dict[str, str] = {}
+        content_batch: ChangedFileContentBatch | None = None
+
+        if not verified_head_sha:
+            if webhook_sha:
+                logger.warning(
+                    "Live GitHub PR head SHA is unavailable for %s/%s PR #%d despite valid webhook SHA (%s); "
+                    "skipping changed-file content retrieval to guarantee snapshot consistency.",
+                    owner,
+                    repo,
+                    pull_number,
+                    webhook_sha[:7],
+                )
+            else:
+                logger.warning(
+                    "Authoritative PR head commit SHA is unavailable for %s/%s PR #%d; "
+                    "failing closed and skipping changed-file content retrieval to prevent unpinned reads.",
+                    owner,
+                    repo,
+                    pull_number,
+                )
+        else:
+            try:
+                file_service = content_service or GitHubFileContentService(client=client)
+                files_to_retrieve = (
+                    pull_request.changed_files
+                    if pull_request is not None and pull_request.changed_files
+                    else context.get("files", [])
+                )
+                content_batch = file_service.retrieve_contents(
+                    repository=f"{owner}/{repo}",
+                    head_commit_sha=verified_head_sha,
+                    changed_files=files_to_retrieve,
+                    client=client,
+                )
+                file_contents = content_batch.contents
+                logger.info(
+                    "Retrieved content for %d/%d changed files at head commit %s for %s/%s PR #%d (%d failures/skipped)",
+                    len(file_contents),
+                    len(files_to_retrieve),
+                    verified_head_sha[:7],
+                    owner,
+                    repo,
+                    pull_number,
+                    len(content_batch.failures),
+                )
+            except Exception as exc:
+                logger.error(
+                    "Error retrieving changed-file contents for %s/%s PR #%d at %s: %s",
+                    owner,
+                    repo,
+                    pull_number,
+                    verified_head_sha[:7],
+                    exc,
+                )
+
+        # Step 6: Make resulting models, head SHA, and file contents available to downstream stages
         return ProcessedPRContext(
             raw_context=context,
             pull_request=pull_request,
             bridge_result=bridge_result,
+            head_commit_sha=verified_head_sha,
+            file_contents=file_contents,
+            content_batch=content_batch,
         )
 
     except GitHubAuthenticationError:

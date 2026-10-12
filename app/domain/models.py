@@ -123,6 +123,7 @@ class PullRequest(BaseModel):
     source_branch: str
     target_branch: str
     state: str
+    head_sha: str | None = None
     commits: list[Commit] = Field(default_factory=list)
     changed_files: list[ChangedFile] = Field(default_factory=list)
 
@@ -169,6 +170,22 @@ class PullRequest(BaseModel):
     def _validate_state(cls, value: str) -> str:
         cleaned = _validate_non_empty_str(value, "state")
         return cleaned.lower()
+
+    @field_validator("head_sha")
+    @classmethod
+    def _validate_head_sha(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            raise ValueError("head_sha must be a string or None")
+        cleaned = value.strip()
+        if not cleaned or not _HEX_SHA_PATTERN.fullmatch(cleaned):
+            raise ValueError(
+                "head_sha must contain hexadecimal characters only and be between 7 and 40 characters in length"
+            )
+        return cleaned.lower()
+
+
 
 
 # ---------------------------------------------------------------------------
