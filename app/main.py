@@ -23,7 +23,7 @@ from fastapi import BackgroundTasks, FastAPI, Request, Response, status
 
 from pydantic import ValidationError
 
-from app.domain.models import PullRequest
+from app.domain.models import InvestigationStatus, PullRequest
 from app.integrations.github.client import (
     GitHubAuthenticationError,
     GitHubClientError,
@@ -33,6 +33,7 @@ from app.integrations.github.client import (
 )
 from app.integrations.github.content import (
     ChangedFileContentBatch,
+    FileContentStatus,
     GitHubFileContentService,
 )
 from app.integrations.github.mapper import GitHubPullRequestMapper
@@ -43,6 +44,11 @@ from app.integrations.github.webhook import (
     verify_signature,
 )
 from app.integrations.jira.bridge import BridgeResult, GitHubJiraBridge
+from app.investigation.pipeline import InvestigationPipelineOrchestrator
+from app.investigation.schemas import (
+    InvestigationPipelineInput,
+    InvestigationResultBundle,
+)
 from app.integrations.jira.client import (
     JiraAuthenticationError,
     JiraClient,
@@ -122,20 +128,20 @@ def _clean_sha(value: object) -> str | None:
 class ProcessedPRContext(dict):
     """
     Result of PR context retrieval, mapping, Jira requirement resolution,
-    and changed-file content retrieval.
+    changed-file content retrieval, and deterministic pipeline orchestration.
 
     Inherits from dict for full backward compatibility with callers and tests expecting
     the raw GitHub context dictionary, while exposing the mapped PullRequest,
-    BridgeResult models, head_commit_sha, and file contents via attributes and the
-    raw_context property.
+    BridgeResult models, head_commit_sha, file contents, investigation bundle,
+    and diagnostics via attributes and the raw_context property.
 
     Design Decision:
       The underlying dictionary contains strictly the original raw GitHub context fields,
       preserving raw payload dictionary equality (context == raw_context) and JSON
       serialization compatibility (json.dumps(context)). Mapped domain models (PullRequest,
-      BridgeResult) and retrieved file contents are exposed explicitly as attributes and
-      properties, preventing domain models or large file buffers from contaminating raw
-      dictionary keys or breaking JSON serializers.
+      BridgeResult), retrieved file contents, and pipeline investigation artifacts are
+      exposed explicitly as attributes and properties, preventing domain models or large
+      file buffers from contaminating raw dictionary keys or breaking JSON serializers.
     """
 
     def __init__(
@@ -146,6 +152,8 @@ class ProcessedPRContext(dict):
         head_commit_sha: str | None = None,
         file_contents: dict[str, str] | None = None,
         content_batch: ChangedFileContentBatch | None = None,
+        investigation_bundle: InvestigationResultBundle | None = None,
+        investigation_error: str | None = None,
     ) -> None:
         super().__init__(raw_context)
         self.pull_request = pull_request
@@ -153,6 +161,8 @@ class ProcessedPRContext(dict):
         self.head_commit_sha = head_commit_sha
         self.file_contents = file_contents if file_contents is not None else {}
         self.content_batch = content_batch
+        self.investigation_bundle = investigation_bundle
+        self.investigation_error = investigation_error
 
     @property
     def raw_context(self) -> dict:
@@ -166,8 +176,8 @@ def process_pull_request_context(
     mapper: GitHubPullRequestMapper | None = None,
     bridge: GitHubJiraBridge | None = None,
     content_service: GitHubFileContentService | None = None,
+    orchestrator: InvestigationPipelineOrchestrator | None = None,
 ) -> ProcessedPRContext | dict | None:
-
     """
     Retrieve and process PR context asynchronously in a background task.
 
@@ -175,18 +185,25 @@ def process_pull_request_context(
     2. Retrieves raw PR context (metadata, changed files with patches, commits).
     3. Maps raw context to canonical PullRequest domain model via GitHubPullRequestMapper.
     4. Resolves linked Jira Requirement via GitHubJiraBridge using PR title and description.
-    5. Returns ProcessedPRContext bundling raw context, PullRequest, and BridgeResult.
+    5. Resolves verified PR head commit SHA from live GitHub PR metadata.
+    6. Retrieves changed-file contents pinned to the verified head commit SHA.
+    7. Executes deterministic InvestigationPipelineOrchestrator if prerequisites are satisfied.
+    8. Returns ProcessedPRContext bundling raw context, PullRequest, BridgeResult,
+       file contents, investigation bundle, and diagnostics.
 
     Security & Reliability:
       - Traps all authentication, API, network, validation, and unexpected errors without crashing.
       - Never logs tokens, JWTs, keys, patches, or credentials.
-      - Gracefully handles PRs with no Jira key or unavailable Jira API.
+      - Gracefully handles PRs with no Jira key, missing head SHA, or unavailable Jira API.
+      - Runs orchestration only on pinned live head commit content.
 
     Args:
         pr_info: Dictionary containing validated PR identifiers:
                  'installation_id', 'owner', 'repo', 'pull_number'.
         mapper: Optional GitHubPullRequestMapper override (defaults to new instance).
         bridge: Optional GitHubJiraBridge override (defaults to get_jira_bridge()).
+        content_service: Optional GitHubFileContentService override.
+        orchestrator: Optional InvestigationPipelineOrchestrator override.
 
     Returns:
         ProcessedPRContext dictionary containing mapped models and raw data,
@@ -415,7 +432,194 @@ def process_pull_request_context(
                     exc,
                 )
 
-        # Step 6: Make resulting models, head SHA, and file contents available to downstream stages
+        # Step 6: Execute investigation pipeline orchestration if eligible
+        investigation_bundle: InvestigationResultBundle | None = None
+        investigation_error: str | None = None
+
+        if pull_request is None:
+            investigation_error = (
+                "Canonical PullRequest model could not be mapped from context; "
+                "orchestration skipped."
+            )
+            logger.info(
+                "Skipping investigation orchestration for %s/%s PR #%d: %s",
+                owner,
+                repo,
+                pull_number,
+                investigation_error,
+            )
+        elif bridge_result is None or not bridge_result.has_requirement:
+            reason = (
+                bridge_result.reason
+                if bridge_result and bridge_result.reason
+                else "No Jira requirement resolved"
+            )
+            investigation_error = (
+                f"Missing linked Jira requirement ({reason}); orchestration skipped."
+            )
+            logger.info(
+                "Skipping investigation orchestration for %s/%s PR #%d: %s",
+                owner,
+                repo,
+                pull_number,
+                investigation_error,
+            )
+        elif not bridge_result.requirement.acceptance_criteria:
+            investigation_error = (
+                "Linked Jira requirement contains no acceptance criteria; "
+                "orchestration skipped."
+            )
+            logger.warning(
+                "Skipping investigation orchestration for %s/%s PR #%d: %s",
+                owner,
+                repo,
+                pull_number,
+                investigation_error,
+            )
+        elif not verified_head_sha:
+            investigation_error = (
+                "Authoritative live GitHub PR head SHA is unavailable; "
+                "orchestration skipped."
+            )
+            logger.warning(
+                "Skipping investigation orchestration for %s/%s PR #%d: %s",
+                owner,
+                repo,
+                pull_number,
+                investigation_error,
+            )
+        elif not pull_request.changed_files:
+            investigation_error = (
+                "Pull request contains no changed files; orchestration skipped."
+            )
+            logger.info(
+                "Skipping investigation orchestration for %s/%s PR #%d: %s",
+                owner,
+                repo,
+                pull_number,
+                investigation_error,
+            )
+        elif content_batch is None:
+            investigation_error = (
+                "Changed-file content retrieval failed or is unavailable; "
+                "orchestration skipped."
+            )
+            logger.warning(
+                "Skipping investigation orchestration for %s/%s PR #%d: %s",
+                owner,
+                repo,
+                pull_number,
+                investigation_error,
+            )
+        elif not file_contents:
+            investigation_error = (
+                "No usable changed-file content could be retrieved; "
+                "orchestration skipped."
+            )
+            logger.warning(
+                "Skipping investigation orchestration for %s/%s PR #%d: %s",
+                owner,
+                repo,
+                pull_number,
+                investigation_error,
+            )
+        else:
+            # Check for eligible changed files that failed content retrieval
+            results_dict = getattr(content_batch, "results", None)
+            if isinstance(results_dict, dict):
+                failed_eligible = {
+                    path: (res.error or getattr(res.status, "value", str(res.status)))
+                    for path, res in results_dict.items()
+                    if getattr(res, "status", None)
+                    not in (
+                        FileContentStatus.SUCCESS,
+                        FileContentStatus.DELETED,
+                        FileContentStatus.BINARY,
+                    )
+                }
+            else:
+                failures_dict = getattr(content_batch, "failures", None)
+                if isinstance(failures_dict, dict):
+                    failed_eligible = dict(failures_dict)
+                else:
+                    failed_eligible = {}
+
+            try:
+                pipeline_input = InvestigationPipelineInput(
+                    pull_request=pull_request,
+                    requirement=bridge_result.requirement,
+                    file_contents=file_contents,
+                    test_results=[],
+                )
+                pipeline_orchestrator = orchestrator or InvestigationPipelineOrchestrator()
+                bundle = pipeline_orchestrator.orchestrate(
+                    pipeline_input,
+                    head_commit_sha=verified_head_sha,
+                )
+
+                inv = getattr(bundle, "investigation", None)
+                inv_status = getattr(inv, "status", None)
+                if inv_status == InvestigationStatus.FAILED:
+                    investigation_bundle = bundle
+                    err_list = getattr(bundle, "errors", [])
+                    investigation_error = (
+                        "; ".join(err_list)
+                        if err_list
+                        else "Investigation pipeline returned FAILED status"
+                    )
+                    logger.warning(
+                        "Investigation pipeline completed with FAILED status for %s/%s PR #%d: %s",
+                        owner,
+                        repo,
+                        pull_number,
+                        investigation_error,
+                    )
+                else:
+                    if failed_eligible:
+                        diagnostic = (
+                            f"Incomplete file content retrieval: {len(failed_eligible)} eligible file(s) "
+                            f"failed retrieval ({', '.join(sorted(failed_eligible.keys()))})"
+                        )
+                        logger.warning(
+                            "Investigation completed on partial inputs for %s/%s PR #%d: %s",
+                            owner,
+                            repo,
+                            pull_number,
+                            diagnostic,
+                        )
+                        investigation_error = diagnostic
+                        if type(bundle) is InvestigationResultBundle:
+                            bundle = bundle.model_copy(
+                                update={"errors": list(bundle.errors) + [diagnostic]}
+                            )
+                        elif hasattr(bundle, "errors") and isinstance(bundle.errors, list):
+                            bundle.errors.append(diagnostic)
+                    investigation_bundle = bundle
+                    findings_count = len(getattr(bundle, "findings", []))
+                    evidence_count = len(getattr(bundle, "evidence", []))
+                    logger.info(
+                        "Investigation pipeline completed for %s/%s PR #%d: %d findings, %d evidence",
+                        owner,
+                        repo,
+                        pull_number,
+                        findings_count,
+                        evidence_count,
+                    )
+            except Exception as exc:
+                logger.error(
+                    "Investigation pipeline exception for %s/%s PR #%d: %s",
+                    owner,
+                    repo,
+                    pull_number,
+                    exc,
+                    exc_info=True,
+                )
+                investigation_bundle = None
+                investigation_error = (
+                    f"Pipeline execution failure: {type(exc).__name__}: {str(exc)}"
+                )
+
+        # Step 7: Make resulting models, head SHA, file contents, and investigation results available
         return ProcessedPRContext(
             raw_context=context,
             pull_request=pull_request,
@@ -423,6 +627,8 @@ def process_pull_request_context(
             head_commit_sha=verified_head_sha,
             file_contents=file_contents,
             content_batch=content_batch,
+            investigation_bundle=investigation_bundle,
+            investigation_error=investigation_error,
         )
 
     except GitHubAuthenticationError:
