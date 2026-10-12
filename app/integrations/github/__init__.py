@@ -20,6 +20,13 @@ from app.integrations.github.client import (
     GitHubNotFoundError,
     GitHubPermissionError,
 )
+from app.integrations.github.content import (
+    ChangedFileContentBatch,
+    ChangedFileContentService,
+    FileContentResult,
+    FileContentStatus,
+    GitHubFileContentService,
+)
 from app.integrations.github.mapper import GitHubPullRequestMapper
 from app.integrations.github.service import get_installation_client
 
@@ -34,4 +41,9 @@ __all__ = [
     "GitHubNetworkError",
     "GitHubPullRequestMapper",
     "get_installation_client",
+    "GitHubFileContentService",
+    "ChangedFileContentService",
+    "ChangedFileContentBatch",
+    "FileContentResult",
+    "FileContentStatus",
 ]

@@ -9,7 +9,11 @@ Security:
   - Returns only curated, non-sensitive metadata needed for analysis.
 """
 
+import base64
+import binascii
 import logging
+from urllib.parse import quote
+
 import requests
 
 from app.integrations.github.auth import (
@@ -528,6 +532,141 @@ class GitHubClient:
             "files": files,
             "commits": commits,
         }
+
+    def get_file_content(
+        self,
+        owner: str,
+        repo: str,
+        path: str,
+        ref: str,
+    ) -> str:
+        """
+        Retrieve the raw text content of a file at a specific commit or ref.
+
+        Args:
+            owner: Repository owner (user or organization).
+            repo: Repository name.
+            path: Relative path to the file in the repository.
+            ref: Git commit SHA, branch, or tag (must be non-empty).
+
+        Returns:
+            The decoded text content of the file.
+
+        Raises:
+            ValueError: If parameters are invalid or empty.
+            GitHubNotFoundError: If the file or ref does not exist (HTTP 404).
+            GitHubAuthenticationError: If access token is invalid or expired (HTTP 401).
+            GitHubPermissionError: If access is forbidden or rate-limited (HTTP 403).
+            GitHubAPIError: For other GitHub API HTTP errors or unsupported file formats.
+            GitHubNetworkError: For network timeouts or connection failures.
+        """
+        if not owner or not isinstance(owner, str) or not owner.strip():
+            raise ValueError("owner must be a non-empty string")
+        if not repo or not isinstance(repo, str) or not repo.strip():
+            raise ValueError("repo must be a non-empty string")
+        if not path or not isinstance(path, str) or not path.strip():
+            raise ValueError("path must be a non-empty string")
+        if not ref or not isinstance(ref, str) or not ref.strip():
+            raise ValueError("ref must be a non-empty string")
+
+        owner_clean = owner.strip()
+        repo_clean = repo.strip()
+        path_clean = path.strip().lstrip("/")
+        ref_clean = ref.strip()
+
+        url = f"{self._base_url}/repos/{owner_clean}/{repo_clean}/contents/{quote(path_clean, safe='/')}"
+        headers = self._headers()
+        params = {"ref": ref_clean}
+
+        try:
+            response = requests.get(url, headers=headers, params=params, timeout=self._timeout)
+        except requests.exceptions.Timeout as exc:
+            logger.error(
+                "GitHub API timeout while fetching file %s at ref %s for %s/%s",
+                path_clean,
+                ref_clean,
+                owner_clean,
+                repo_clean,
+            )
+            raise GitHubNetworkError(
+                f"Request timed out while fetching file '{path_clean}' for {owner_clean}/{repo_clean}"
+            ) from exc
+        except requests.exceptions.RequestException as exc:
+            logger.error(
+                "GitHub API network failure while fetching file %s at ref %s for %s/%s: %s",
+                path_clean,
+                ref_clean,
+                owner_clean,
+                repo_clean,
+                type(exc).__name__,
+            )
+            raise GitHubNetworkError(
+                f"Network error while communicating with GitHub API: {type(exc).__name__}"
+            ) from exc
+
+        if response.status_code == 404:
+            raise GitHubNotFoundError(
+                f"File '{path_clean}' not found in {owner_clean}/{repo_clean} at ref '{ref_clean}'"
+            )
+        if response.status_code == 401:
+            raise GitHubAuthenticationError(
+                "GitHub API authentication failed. Verify that the installation token is valid."
+            )
+        if response.status_code == 403:
+            raise GitHubPermissionError(
+                f"GitHub API permission denied for {owner_clean}/{repo_clean}. Check App permissions or rate limits."
+            )
+        if response.status_code != 200:
+            raise GitHubAPIError(
+                f"GitHub API error (HTTP {response.status_code}) while fetching file '{path_clean}' for {owner_clean}/{repo_clean}",
+                status_code=response.status_code,
+            )
+
+        try:
+            data = response.json()
+        except ValueError:
+            return response.text
+
+        if isinstance(data, list):
+            raise GitHubAPIError(
+                f"Path '{path_clean}' is a directory, not a regular file"
+            )
+
+        if isinstance(data, dict):
+            target_type = data.get("type")
+            if target_type and target_type != "file":
+                raise GitHubAPIError(
+                    f"Target '{path_clean}' is a {target_type}, not a regular file"
+                )
+            encoding = data.get("encoding")
+            raw_content = data.get("content")
+            if encoding == "base64" and raw_content is not None:
+                try:
+                    content_bytes = base64.b64decode(raw_content)
+                except (binascii.Error, ValueError) as exc:
+                    raise GitHubAPIError(
+                        f"File '{path_clean}' contains malformed or invalid Base64 content"
+                    ) from exc
+
+                try:
+                    return content_bytes.decode("utf-8")
+                except UnicodeDecodeError as exc:
+                    raise GitHubAPIError(
+                        f"File '{path_clean}' cannot be decoded as UTF-8 text"
+                    ) from exc
+            elif raw_content is not None and isinstance(raw_content, str):
+                return raw_content
+            elif "download_url" in data and not raw_content:
+                if data.get("size") == 0:
+                    return ""
+                raise GitHubAPIError(
+                    f"File '{path_clean}' content is unavailable via contents API (size: {data.get('size')} bytes)"
+                )
+
+        if isinstance(data, str):
+            return data
+
+        return response.text
 
     def _handle_error_response(
         self,
