@@ -27,10 +27,25 @@ from app.integrations.github.client import (
     GitHubNetworkError,
     GitHubAPIError,
 )
-from app.domain.models import AcceptanceCriterion, PullRequest, Requirement
+from app.domain.models import (
+    AcceptanceCriterion,
+    InvestigationStatus,
+    PullRequest,
+    Requirement,
+)
+from app.integrations.github.content import (
+    ChangedFileContentBatch,
+    FileContentResult,
+    FileContentStatus,
+)
 from app.integrations.github.webhook import extract_pr_info, verify_signature
 from app.integrations.jira.bridge import BridgeResult
 from app.integrations.jira.client import JiraAuthenticationError, JiraNetworkError
+from app.investigation.pipeline import InvestigationPipelineOrchestrator
+from app.investigation.schemas import (
+    InvestigationPipelineInput,
+    InvestigationResultBundle,
+)
 from app.main import (
     ProcessedPRContext,
     app,
@@ -1250,6 +1265,698 @@ class TestPhase3HeadShaAndContentRetrieval(unittest.TestCase):
         self.assertNotIn("head_commit_sha", result)
         self.assertNotIn("file_contents", result)
         self.assertNotIn("content_batch", result)
+        self.assertNotIn("investigation_bundle", result)
+        self.assertNotIn("investigation_error", result)
+
+
+class TestWebhookInvestigationPipelineOrchestration(unittest.TestCase):
+    """
+    Test suite for connecting the webhook background worker to InvestigationPipelineOrchestrator
+    (DevSense Phase 3, Step 2).
+    """
+
+    def setUp(self):
+        self.pr_info = {
+            "installation_id": 123456,
+            "owner": "SurajD45",
+            "repo": "devsense",
+            "pull_number": 10,
+            "head_commit_sha": "a1b2c3d4e5f67890a1b2c3d4e5f67890a1b2c3d4",
+        }
+        self.raw_github_context = {
+            "pull_request": {
+                "number": 10,
+                "title": "SCRUM-5 Implement user authentication",
+                "body": "Fixes SCRUM-5 by implementing JWT authentication.",
+                "author": "suraj",
+                "head_branch": "feature/auth",
+                "base_branch": "main",
+                "state": "open",
+                "head_sha": "a1b2c3d4e5f67890a1b2c3d4e5f67890a1b2c3d4",
+            },
+            "files": [
+                {
+                    "filename": "app/auth.py",
+                    "status": "modified",
+                    "additions": 42,
+                    "deletions": 0,
+                    "changes": 42,
+                    "patch": "@@ -0,0 +1,42 @@",
+                }
+            ],
+            "commits": [
+                {
+                    "sha": "a1b2c3d4e5f67890a1b2c3d4e5f67890a1b2c3d4",
+                    "message": "feat: add user authentication",
+                    "author": "suraj",
+                }
+            ],
+        }
+        self.mock_requirement = Requirement(
+            requirement_id="SCRUM-5",
+            title="Implement user authentication",
+            description="Users must authenticate via JWT",
+            source="https://jira.example.com/browse/SCRUM-5",
+            status="In Progress",
+            acceptance_criteria=[
+                AcceptanceCriterion(
+                    criterion_id="AC-1",
+                    title="User can log in with valid credentials",
+                )
+            ],
+        )
+        self.valid_bridge_result = BridgeResult(
+            requirement=self.mock_requirement,
+            jira_key="SCRUM-5",
+            reason="Requirement mapped from Jira issue SCRUM-5.",
+        )
+
+    @patch("app.main.get_jira_bridge")
+    @patch("app.main.get_installation_client")
+    def test_successful_worker_to_orchestrator_invocation(
+        self, mock_get_github_client, mock_get_jira_bridge
+    ):
+        """1. Successful worker-to-orchestrator invocation with exact input and live SHA."""
+        mock_github = MagicMock()
+        mock_github.get_pull_request_context.return_value = self.raw_github_context
+        mock_get_github_client.return_value = mock_github
+
+        mock_bridge = MagicMock()
+        mock_bridge.get_requirement_for_pr.return_value = self.valid_bridge_result
+        mock_get_jira_bridge.return_value = mock_bridge
+
+        mock_content_service = MagicMock()
+        mock_batch = MagicMock()
+        mock_batch.contents = {"app/auth.py": "def authenticate(): pass\n"}
+        mock_batch.failures = {}
+        mock_content_service.retrieve_contents.return_value = mock_batch
+
+        mock_orchestrator = MagicMock(spec=InvestigationPipelineOrchestrator)
+        mock_bundle = MagicMock(spec=InvestigationResultBundle)
+        mock_bundle.investigation = MagicMock(status=InvestigationStatus.COMPLETED)
+        mock_bundle.findings = [MagicMock()]
+        mock_bundle.evidence = [MagicMock()]
+        mock_bundle.errors = []
+        mock_orchestrator.orchestrate.return_value = mock_bundle
+
+        result = process_pull_request_context(
+            self.pr_info,
+            content_service=mock_content_service,
+            orchestrator=mock_orchestrator,
+        )
+
+        self.assertIsNotNone(result)
+        self.assertIs(result.investigation_bundle, mock_bundle)
+        self.assertIsNone(result.investigation_error)
+        self.assertEqual(
+            result.head_commit_sha,
+            "a1b2c3d4e5f67890a1b2c3d4e5f67890a1b2c3d4",
+        )
+
+        mock_orchestrator.orchestrate.assert_called_once()
+        call_args, call_kwargs = mock_orchestrator.orchestrate.call_args
+        pipeline_input = call_args[0]
+        self.assertIsInstance(pipeline_input, InvestigationPipelineInput)
+        self.assertEqual(pipeline_input.pull_request.number, 10)
+        self.assertEqual(pipeline_input.requirement.requirement_id, "SCRUM-5")
+        self.assertEqual(
+            pipeline_input.file_contents,
+            {"app/auth.py": "def authenticate(): pass\n"},
+        )
+        self.assertEqual(pipeline_input.test_results, [])
+        self.assertEqual(
+            call_kwargs.get("head_commit_sha"),
+            "a1b2c3d4e5f67890a1b2c3d4e5f67890a1b2c3d4",
+        )
+
+    @patch("app.main.get_jira_bridge")
+    @patch("app.main.get_installation_client")
+    def test_deterministic_e2e_orchestration_without_mock_orchestrator(
+        self, mock_get_github_client, mock_get_jira_bridge
+    ):
+        """1b. Real deterministic InvestigationPipelineOrchestrator runs end-to-end."""
+        mock_github = MagicMock()
+        mock_github.get_pull_request_context.return_value = self.raw_github_context
+        mock_github.get_file_content.return_value = "def login(): pass\n"
+        mock_get_github_client.return_value = mock_github
+
+        mock_bridge = MagicMock()
+        mock_bridge.get_requirement_for_pr.return_value = self.valid_bridge_result
+        mock_get_jira_bridge.return_value = mock_bridge
+
+        result = process_pull_request_context(self.pr_info)
+
+        self.assertIsNotNone(result)
+        self.assertIsNotNone(result.investigation_bundle)
+        self.assertEqual(
+            result.investigation_bundle.investigation.status,
+            InvestigationStatus.COMPLETED,
+        )
+        self.assertEqual(len(result.investigation_bundle.findings), 1)
+        self.assertEqual(
+            result.investigation_bundle.findings[0].criterion_id,
+            "AC-1",
+        )
+        self.assertIsNone(result.investigation_error)
+
+    @patch("app.main.get_jira_bridge")
+    @patch("app.main.get_installation_client")
+    def test_orchestration_skipped_when_jira_requirement_missing(
+        self, mock_get_github_client, mock_get_jira_bridge
+    ):
+        """2. Missing Jira requirement skips orchestration and sets diagnostic error."""
+        mock_github = MagicMock()
+        mock_github.get_pull_request_context.return_value = self.raw_github_context
+        mock_get_github_client.return_value = mock_github
+
+        mock_bridge = MagicMock()
+        mock_bridge.get_requirement_for_pr.return_value = BridgeResult(
+            requirement=None,
+            jira_key=None,
+            reason="No Jira key found in PR title or body.",
+        )
+        mock_get_jira_bridge.return_value = mock_bridge
+
+        mock_orchestrator = MagicMock()
+
+        result = process_pull_request_context(
+            self.pr_info,
+            orchestrator=mock_orchestrator,
+        )
+
+        mock_orchestrator.orchestrate.assert_not_called()
+        self.assertIsNone(result.investigation_bundle)
+        self.assertIsNotNone(result.investigation_error)
+        self.assertIn("Missing linked Jira requirement", result.investigation_error)
+        self.assertIn("No Jira key found", result.investigation_error)
+
+    @patch("app.main.get_jira_bridge")
+    @patch("app.main.get_installation_client")
+    def test_orchestration_skipped_when_jira_requirement_has_no_criteria(
+        self, mock_get_github_client, mock_get_jira_bridge
+    ):
+        """2b. Jira requirement with empty acceptance criteria skips orchestration."""
+        mock_github = MagicMock()
+        mock_github.get_pull_request_context.return_value = self.raw_github_context
+        mock_get_github_client.return_value = mock_github
+
+        empty_req = Requirement(
+            requirement_id="SCRUM-5",
+            title="Empty requirement",
+            source="https://jira.example.com/browse/SCRUM-5",
+            status="In Progress",
+            acceptance_criteria=[],
+        )
+        mock_bridge = MagicMock()
+        mock_bridge.get_requirement_for_pr.return_value = BridgeResult(
+            requirement=empty_req,
+            jira_key="SCRUM-5",
+            reason="Requirement mapped with no criteria.",
+        )
+        mock_get_jira_bridge.return_value = mock_bridge
+
+        mock_orchestrator = MagicMock()
+
+        result = process_pull_request_context(
+            self.pr_info,
+            orchestrator=mock_orchestrator,
+        )
+
+        mock_orchestrator.orchestrate.assert_not_called()
+        self.assertIsNone(result.investigation_bundle)
+        self.assertIsNotNone(result.investigation_error)
+        self.assertIn("contains no acceptance criteria", result.investigation_error)
+
+    @patch("app.main.get_jira_bridge")
+    @patch("app.main.get_installation_client")
+    def test_orchestration_skipped_when_live_head_sha_missing(
+        self, mock_get_github_client, mock_get_jira_bridge
+    ):
+        """3. Missing live head SHA skips orchestration and sets diagnostic error."""
+        context_no_sha = dict(self.raw_github_context)
+        context_no_sha["pull_request"] = dict(self.raw_github_context["pull_request"])
+        del context_no_sha["pull_request"]["head_sha"]
+
+        info_no_sha = dict(self.pr_info)
+        del info_no_sha["head_commit_sha"]
+
+        mock_github = MagicMock()
+        mock_github.get_pull_request_context.return_value = context_no_sha
+        mock_get_github_client.return_value = mock_github
+
+        mock_bridge = MagicMock()
+        mock_bridge.get_requirement_for_pr.return_value = self.valid_bridge_result
+        mock_get_jira_bridge.return_value = mock_bridge
+
+        mock_orchestrator = MagicMock()
+
+        result = process_pull_request_context(
+            info_no_sha,
+            orchestrator=mock_orchestrator,
+        )
+
+        mock_orchestrator.orchestrate.assert_not_called()
+        self.assertIsNone(result.investigation_bundle)
+        self.assertIsNotNone(result.investigation_error)
+        self.assertIn(
+            "Authoritative live GitHub PR head SHA is unavailable",
+            result.investigation_error,
+        )
+
+    @patch("app.main.get_jira_bridge")
+    @patch("app.main.get_installation_client")
+    def test_orchestration_skipped_when_changeset_is_empty(
+        self, mock_get_github_client, mock_get_jira_bridge
+    ):
+        """4. Empty changeset skips orchestration without crashing worker."""
+        context_no_files = dict(self.raw_github_context)
+        context_no_files["files"] = []
+
+        mock_github = MagicMock()
+        mock_github.get_pull_request_context.return_value = context_no_files
+        mock_get_github_client.return_value = mock_github
+
+        mock_bridge = MagicMock()
+        mock_bridge.get_requirement_for_pr.return_value = self.valid_bridge_result
+        mock_get_jira_bridge.return_value = mock_bridge
+
+        mock_orchestrator = MagicMock()
+
+        result = process_pull_request_context(
+            self.pr_info,
+            orchestrator=mock_orchestrator,
+        )
+
+        mock_orchestrator.orchestrate.assert_not_called()
+        self.assertIsNone(result.investigation_bundle)
+        self.assertIsNotNone(result.investigation_error)
+        self.assertIn("contains no changed files", result.investigation_error)
+
+    @patch("app.main.get_jira_bridge")
+    @patch("app.main.get_installation_client")
+    def test_orchestrator_exception_is_trapped_and_logged(
+        self, mock_get_github_client, mock_get_jira_bridge
+    ):
+        """5. Orchestrator exception is trapped, logged, and exposes diagnostic error."""
+        mock_github = MagicMock()
+        mock_github.get_pull_request_context.return_value = self.raw_github_context
+        mock_github.get_file_content.return_value = "def auth(): pass"
+        mock_get_github_client.return_value = mock_github
+
+        mock_bridge = MagicMock()
+        mock_bridge.get_requirement_for_pr.return_value = self.valid_bridge_result
+        mock_get_jira_bridge.return_value = mock_bridge
+
+        mock_orchestrator = MagicMock()
+        mock_orchestrator.orchestrate.side_effect = RuntimeError("Parser crashed unexpectedly")
+
+        with self.assertLogs("server", level="ERROR") as log_cm:
+            result = process_pull_request_context(
+                self.pr_info,
+                orchestrator=mock_orchestrator,
+            )
+
+        self.assertIsNotNone(result)
+        self.assertIsNone(result.investigation_bundle)
+        self.assertIsNotNone(result.investigation_error)
+        self.assertIn(
+            "Pipeline execution failure: RuntimeError: Parser crashed unexpectedly",
+            result.investigation_error,
+        )
+
+        # Confirm error log with exc_info was emitted
+        error_logs = [msg for msg in log_cm.output if "Investigation pipeline exception" in msg]
+        self.assertTrue(error_logs)
+        self.assertIn("SurajD45/devsense PR #10", error_logs[0])
+
+    @patch("app.main.get_jira_bridge")
+    @patch("app.main.get_installation_client")
+    def test_orchestrator_returning_failed_bundle_is_exposed(
+        self, mock_get_github_client, mock_get_jira_bridge
+    ):
+        """5b. Orchestrator returning FAILED bundle populates bundle and investigation_error."""
+        mock_github = MagicMock()
+        mock_github.get_pull_request_context.return_value = self.raw_github_context
+        mock_github.get_file_content.return_value = "def auth(): pass"
+        mock_get_github_client.return_value = mock_github
+
+        mock_bridge = MagicMock()
+        mock_bridge.get_requirement_for_pr.return_value = self.valid_bridge_result
+        mock_get_jira_bridge.return_value = mock_bridge
+
+        mock_orchestrator = MagicMock()
+        failed_bundle = MagicMock(spec=InvestigationResultBundle)
+        failed_bundle.investigation = MagicMock(status=InvestigationStatus.FAILED)
+        failed_bundle.findings = []
+        failed_bundle.evidence = []
+        failed_bundle.errors = ["AST parse error in app/auth.py"]
+        mock_orchestrator.orchestrate.return_value = failed_bundle
+
+        result = process_pull_request_context(
+            self.pr_info,
+            orchestrator=mock_orchestrator,
+        )
+
+        self.assertIsNotNone(result)
+        self.assertIs(result.investigation_bundle, failed_bundle)
+        self.assertEqual(result.investigation_error, "AST parse error in app/auth.py")
+
+    @patch("app.main.get_jira_bridge")
+    @patch("app.main.get_installation_client")
+    def test_partial_file_retrieval_and_visible_failure_diagnostics(
+        self, mock_get_github_client, mock_get_jira_bridge
+    ):
+        """6. Partial file retrieval runs orchestration on successful files and surfaces failure diagnostics."""
+        context_two_files = dict(self.raw_github_context)
+        context_two_files["files"] = [
+            {"filename": "app/auth.py", "status": "modified"},
+            {"filename": "app/broken.py", "status": "modified"},
+        ]
+
+        mock_github = MagicMock()
+        mock_github.get_pull_request_context.return_value = context_two_files
+        mock_get_github_client.return_value = mock_github
+
+        mock_bridge = MagicMock()
+        mock_bridge.get_requirement_for_pr.return_value = self.valid_bridge_result
+        mock_get_jira_bridge.return_value = mock_bridge
+
+        # Content service returns partial results: auth.py SUCCESS, broken.py ERROR
+        batch = ChangedFileContentBatch()
+        batch.results["app/auth.py"] = FileContentResult(
+            path="app/auth.py",
+            content="def auth(): pass",
+            status=FileContentStatus.SUCCESS,
+            size_bytes=16,
+        )
+        batch.results["app/broken.py"] = FileContentResult(
+            path="app/broken.py",
+            content=None,
+            status=FileContentStatus.ERROR,
+            error="GitHub API 500 server error",
+        )
+
+        mock_content_service = MagicMock()
+        mock_content_service.retrieve_contents.return_value = batch
+
+        mock_orchestrator = MagicMock(spec=InvestigationPipelineOrchestrator)
+        mock_bundle = MagicMock(spec=InvestigationResultBundle)
+        mock_bundle.investigation = MagicMock(status=InvestigationStatus.COMPLETED)
+        mock_bundle.findings = [MagicMock()]
+        mock_bundle.evidence = [MagicMock()]
+        mock_bundle.errors = []
+        mock_orchestrator.orchestrate.return_value = mock_bundle
+
+        result = process_pull_request_context(
+            self.pr_info,
+            content_service=mock_content_service,
+            orchestrator=mock_orchestrator,
+        )
+
+        self.assertIsNotNone(result)
+        # Orchestration ran with only successfully retrieved files
+        mock_orchestrator.orchestrate.assert_called_once()
+        pipeline_input = mock_orchestrator.orchestrate.call_args[0][0]
+        self.assertEqual(pipeline_input.file_contents, {"app/auth.py": "def auth(): pass"})
+        self.assertNotIn("app/broken.py", pipeline_input.file_contents)
+
+        # Batch preserves full failure information
+        self.assertIn("app/broken.py", result.content_batch.failures)
+        self.assertEqual(
+            result.content_batch.failures["app/broken.py"],
+            "GitHub API 500 server error",
+        )
+
+        # Result bundle and investigation_error surface visible diagnostics
+        self.assertIsNotNone(result.investigation_bundle)
+        self.assertIsNotNone(result.investigation_error)
+        self.assertIn("Incomplete file content retrieval", result.investigation_error)
+        self.assertIn("app/broken.py", result.investigation_error)
+        self.assertIn(result.investigation_error, mock_bundle.errors)
+
+    @patch("app.main.get_jira_bridge")
+    @patch("app.main.get_installation_client")
+    def test_partial_file_retrieval_with_real_orchestrator(
+        self, mock_get_github_client, mock_get_jira_bridge
+    ):
+        """6b. Partial file retrieval with real orchestrator updates bundle.errors cleanly."""
+        context_two_files = dict(self.raw_github_context)
+        context_two_files["files"] = [
+            {"filename": "app/auth.py", "status": "modified"},
+            {"filename": "app/broken.py", "status": "modified"},
+        ]
+
+        mock_github = MagicMock()
+        mock_github.get_pull_request_context.return_value = context_two_files
+        mock_get_github_client.return_value = mock_github
+
+        mock_bridge = MagicMock()
+        mock_bridge.get_requirement_for_pr.return_value = self.valid_bridge_result
+        mock_get_jira_bridge.return_value = mock_bridge
+
+        batch = ChangedFileContentBatch()
+        batch.results["app/auth.py"] = FileContentResult(
+            path="app/auth.py",
+            content="def login(): pass\n",
+            status=FileContentStatus.SUCCESS,
+            size_bytes=19,
+        )
+        batch.results["app/broken.py"] = FileContentResult(
+            path="app/broken.py",
+            content=None,
+            status=FileContentStatus.ERROR,
+            error="GitHub API 500 server error",
+        )
+
+        mock_content_service = MagicMock()
+        mock_content_service.retrieve_contents.return_value = batch
+
+        result = process_pull_request_context(
+            self.pr_info,
+            content_service=mock_content_service,
+        )
+
+        self.assertIsNotNone(result)
+        self.assertIsNotNone(result.investigation_bundle)
+        self.assertEqual(
+            result.investigation_bundle.investigation.status,
+            InvestigationStatus.COMPLETED,
+        )
+        self.assertIsNotNone(result.investigation_error)
+        self.assertIn("Incomplete file content retrieval", result.investigation_error)
+        self.assertIn("app/broken.py", result.investigation_error)
+        self.assertIn(
+            result.investigation_error,
+            result.investigation_bundle.errors,
+        )
+
+    @patch("app.main.get_jira_bridge")
+    @patch("app.main.get_installation_client")
+    def test_orchestration_skipped_when_all_eligible_files_fail_retrieval(
+        self, mock_get_github_client, mock_get_jira_bridge
+    ):
+        """6c. When all eligible files fail retrieval, orchestration is skipped and failures remain accessible."""
+        context_files = dict(self.raw_github_context)
+        context_files["files"] = [
+            {"filename": "app/auth.py", "status": "modified"},
+            {"filename": "app/service.py", "status": "modified"},
+        ]
+
+        mock_github = MagicMock()
+        mock_github.get_pull_request_context.return_value = context_files
+        mock_get_github_client.return_value = mock_github
+
+        mock_bridge = MagicMock()
+        mock_bridge.get_requirement_for_pr.return_value = self.valid_bridge_result
+        mock_get_jira_bridge.return_value = mock_bridge
+
+        batch = ChangedFileContentBatch()
+        batch.results["app/auth.py"] = FileContentResult(
+            path="app/auth.py",
+            content=None,
+            status=FileContentStatus.ERROR,
+            error="API timeout (504)",
+        )
+        batch.results["app/service.py"] = FileContentResult(
+            path="app/service.py",
+            content=None,
+            status=FileContentStatus.NOT_FOUND,
+            error="File not found at ref",
+        )
+
+        mock_content_service = MagicMock()
+        mock_content_service.retrieve_contents.return_value = batch
+
+        mock_orchestrator = MagicMock()
+
+        result = process_pull_request_context(
+            self.pr_info,
+            content_service=mock_content_service,
+            orchestrator=mock_orchestrator,
+        )
+
+        # Assert orchestrator is NOT called
+        mock_orchestrator.orchestrate.assert_not_called()
+
+        # Assert bundle is None and diagnostic error is set
+        self.assertIsNotNone(result)
+        self.assertIsNone(result.investigation_bundle)
+        self.assertEqual(
+            result.investigation_error,
+            "No usable changed-file content could be retrieved; orchestration skipped.",
+        )
+
+        # Assert content batch and failure metadata remain intact and accessible
+        self.assertIs(result.content_batch, batch)
+        self.assertEqual(result.file_contents, {})
+        self.assertIn("app/auth.py", result.content_batch.failures)
+        self.assertIn("app/service.py", result.content_batch.failures)
+        self.assertEqual(
+            result.content_batch.failures["app/auth.py"],
+            "API timeout (504)",
+        )
+        self.assertEqual(
+            result.content_batch.failures["app/service.py"],
+            "File not found at ref",
+        )
+
+    @patch("app.main.get_jira_bridge")
+    @patch("app.main.get_installation_client")
+    def test_orchestration_skipped_when_all_changed_files_are_deleted_or_binary(
+        self, mock_get_github_client, mock_get_jira_bridge
+    ):
+        """6d. When all changed files are deleted or binary, orchestration is skipped safely."""
+        context_non_text = dict(self.raw_github_context)
+        context_non_text["files"] = [
+            {"filename": "old_code.py", "status": "removed"},
+            {"filename": "assets/logo.png", "status": "added"},
+        ]
+
+        mock_github = MagicMock()
+        mock_github.get_pull_request_context.return_value = context_non_text
+        mock_get_github_client.return_value = mock_github
+
+        mock_bridge = MagicMock()
+        mock_bridge.get_requirement_for_pr.return_value = self.valid_bridge_result
+        mock_get_jira_bridge.return_value = mock_bridge
+
+        mock_orchestrator = MagicMock()
+
+        result = process_pull_request_context(
+            self.pr_info,
+            orchestrator=mock_orchestrator,
+        )
+
+        mock_orchestrator.orchestrate.assert_not_called()
+        self.assertIsNotNone(result)
+        self.assertIsNone(result.investigation_bundle)
+        self.assertEqual(
+            result.investigation_error,
+            "No usable changed-file content could be retrieved; orchestration skipped.",
+        )
+        self.assertEqual(result.file_contents, {})
+        self.assertEqual(
+            result.content_batch.results["old_code.py"].status,
+            FileContentStatus.DELETED,
+        )
+        self.assertEqual(
+            result.content_batch.results["assets/logo.png"].status,
+            FileContentStatus.BINARY,
+        )
+
+    @patch("app.main.get_jira_bridge")
+    @patch("app.main.get_installation_client")
+    def test_processed_pr_context_dict_equality_and_json_with_attached_bundle(
+        self, mock_get_github_client, mock_get_jira_bridge
+    ):
+        """7. ProcessedPRContext preserves dict equality and json.dumps() with attached bundle."""
+        mock_github = MagicMock()
+        mock_github.get_pull_request_context.return_value = self.raw_github_context
+        mock_github.get_file_content.return_value = "def auth(): pass\n"
+        mock_get_github_client.return_value = mock_github
+
+        mock_bridge = MagicMock()
+        mock_bridge.get_requirement_for_pr.return_value = self.valid_bridge_result
+        mock_get_jira_bridge.return_value = mock_bridge
+
+        result = process_pull_request_context(self.pr_info)
+
+        self.assertIsNotNone(result.investigation_bundle)
+        # Raw dict equality
+        self.assertEqual(result, self.raw_github_context)
+        self.assertEqual(result.raw_context, self.raw_github_context)
+
+        # JSON serialization matches raw context JSON exactly
+        self.assertEqual(json.dumps(result), json.dumps(self.raw_github_context))
+
+        # Attributes exist and are not in dictionary keys
+        self.assertNotIn("investigation_bundle", result)
+        self.assertNotIn("investigation_error", result)
+        self.assertNotIn("head_commit_sha", result)
+        self.assertNotIn("file_contents", result)
+        self.assertNotIn("content_batch", result)
+
+    def test_processed_pr_context_explicit_attributes(self):
+        """7b. ProcessedPRContext constructor initializes investigation attributes cleanly."""
+        mock_bundle = MagicMock(spec=InvestigationResultBundle)
+        ctx = ProcessedPRContext(
+            raw_context={"key": "value"},
+            investigation_bundle=mock_bundle,
+            investigation_error="test-error",
+        )
+
+        self.assertEqual(ctx, {"key": "value"})
+        self.assertEqual(ctx.raw_context, {"key": "value"})
+        self.assertEqual(json.dumps(ctx), json.dumps({"key": "value"}))
+        self.assertIs(ctx.investigation_bundle, mock_bundle)
+        self.assertEqual(ctx.investigation_error, "test-error")
+        self.assertNotIn("investigation_bundle", ctx)
+        self.assertNotIn("investigation_error", ctx)
+
+    @patch("app.main.process_pull_request_context")
+    def test_webhook_endpoint_schedules_orchestration_background_task(
+        self, mock_process_pr
+    ):
+        """8. Webhook endpoint returns HTTP 200 and schedules background task."""
+        client = TestClient(app)
+        payload = {
+            "action": "opened",
+            "installation": {"id": 123456},
+            "pull_request": {
+                "number": 10,
+                "html_url": "https://github.com/SurajD45/devsense/pull/10",
+                "user": {"login": "suraj"},
+                "head": {"ref": "feature/auth", "sha": "a1b2c3d4e5f67890a1b2c3d4e5f67890a1b2c3d4"},
+                "base": {"ref": "main"},
+            },
+            "repository": {
+                "name": "devsense",
+                "full_name": "SurajD45/devsense",
+                "owner": {"login": "SurajD45"},
+            },
+        }
+        body = json.dumps(payload).encode("utf-8")
+        signature = "sha256=" + hmac.new(
+            GITHUB_WEBHOOK_SECRET.encode("utf-8"), body, hashlib.sha256
+        ).hexdigest()
+
+        response = client.post(
+            "/webhooks/github",
+            content=body,
+            headers={
+                "X-Hub-Signature-256": signature,
+                "X-GitHub-Event": "pull_request",
+                "X-GitHub-Delivery": "delivery-789",
+                "Content-Type": "application/json",
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"status": "accepted", "pr_number": 10})
+        mock_process_pr.assert_called_once()
+        called_pr_info = mock_process_pr.call_args[0][0]
+        self.assertEqual(called_pr_info["pull_number"], 10)
+        self.assertEqual(called_pr_info["installation_id"], 123456)
 
 
 if __name__ == "__main__":
