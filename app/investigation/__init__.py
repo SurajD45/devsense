@@ -29,6 +29,9 @@ from app.investigation.schemas import (
     PrioritizedFile,
     RequirementAnalysis,
     RequirementAwareCodeInvestigationInput,
+    TestEvidenceBuildResult,
+    TestExecutionRecord,
+    TestExecutionStatus,
 )
 from app.investigation.service import (
     ChangeImpactAnalysisService,
@@ -39,6 +42,7 @@ from app.investigation.service import (
     RequirementAnalysisService,
     RequirementAwareCodeInvestigationService,
     SuspiciousFilePromotionService,
+    TestEvidenceBuilder,
 )
 
 __all__ = [
@@ -72,5 +76,9 @@ __all__ = [
     "RequirementAwareCodeInvestigationInput",
     "RequirementAwareCodeInvestigationService",
     "SuspiciousFilePromotionService",
+    "TestEvidenceBuildResult",
+    "TestEvidenceBuilder",
+    "TestExecutionRecord",
+    "TestExecutionStatus",
 ]
 
